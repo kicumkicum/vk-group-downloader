@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import subprocess
 import shutil
+from typing import Optional, List, Tuple, Dict, Any
 
 try:
     import requests
@@ -168,7 +169,7 @@ class VKAudioDownloader:
 
             raise ValueError(f"Не удалось распознать ID группы по screen name: {self.group_id!r}")
 
-    def _api_request(self, method, params=None, http_method: str = "GET", api_version: str | None = None):
+    def _api_request(self, method, params=None, http_method: str = "GET", api_version: Optional[str] = None):
         """Вызов VK API (GET/POST)"""
         params = params or {}
         # Параметры совместимости для некоторых методов VK
@@ -808,7 +809,7 @@ def download_audio(audio, output_dir, session):
                     return None, "failed to fetch m3u8"
 
                 ts_tmp = filepath.with_suffix(".part.ts")
-                key_cache: dict[str, bytes] = {}
+                key_cache: Dict[str, bytes] = {}
 
                 def fetch_key(key_url: str) -> bytes:
                     if key_url in key_cache:
@@ -825,8 +826,8 @@ def download_audio(audio, output_dir, session):
                 cur_method = "NONE"
                 cur_key_url = None
 
-                seg_urls: list[str] = []
-                seg_encrypt: list[tuple[str, str | None]] = []
+                seg_urls: List[str] = []
+                seg_encrypt: List[Tuple[str, Optional[str]]] = []
 
                 lines_all = [ln.strip() for ln in m3u8_text.splitlines() if ln.strip()]
                 for ln in lines_all:
@@ -1033,7 +1034,7 @@ def _extract_audio_urls_from_payload(payload):
     return urls
 
 
-def _pick_best_audio_url(urls: list[str]) -> str | None:
+def _pick_best_audio_url(urls: List[str]) -> Optional[str]:
     if not urls:
         return None
     # Убираем мусор/заглушки
@@ -1061,7 +1062,7 @@ def _pick_best_audio_url(urls: list[str]) -> str | None:
     return clean[0]
 
 
-def resolve_audio_url_web(session: requests.Session, audio: dict, group_owner_id: int | None = None) -> str | None:
+def resolve_audio_url_web(session: requests.Session, audio: dict, group_owner_id: Optional[int] = None) -> Optional[str]:
     """
     Если VK отдаёт заглушку/непрямую ссылку, пробуем получить реальный URL через al_audio.php act=reload_audio.
     Требуются рабочие cookies (сессия vk.com).
@@ -1448,7 +1449,7 @@ def load_or_create_cookies_json(cookies_path: str) -> dict:
     return get_cookies_from_file(str(path))
 
 
-def cookies_seem_valid(session: requests.Session) -> tuple[bool, str]:
+def cookies_seem_valid(session: requests.Session) -> Tuple[bool, str]:
     """
     Быстрая проверка: если vk.com/m.vk.com кидает на логин или отдаёт форму логина — cookies протухли.
     """
@@ -1464,7 +1465,7 @@ def cookies_seem_valid(session: requests.Session) -> tuple[bool, str]:
     return True, ""
 
 
-def cookies_look_complete(cookies: dict) -> tuple[bool, str]:
+def cookies_look_complete(cookies: dict) -> Tuple[bool, str]:
     """
     Частая проблема: копируют только 2-3 cookies (remixstlid/remixlgck),
     но для залогиненной сессии обычно нужен session cookie (часто remixsid*).
@@ -1478,7 +1479,7 @@ def cookies_look_complete(cookies: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def check_audio_playlists_access(downloader: VKAudioDownloader) -> tuple[bool, str]:
+def check_audio_playlists_access(downloader: VKAudioDownloader) -> Tuple[bool, str]:
     """
     Проверяем доступ именно к аудио-страницам, а не к главной m.vk.com.
     """
