@@ -11,11 +11,14 @@ import time
 import re
 import hashlib
 import urllib.parse
+import html as _html
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import subprocess
 import shutil
 from typing import Optional, List, Tuple, Dict, Any
+import threading
+import concurrent.futures as _futures
 
 try:
     import requests
@@ -92,11 +95,35 @@ class VKAudioDownloader:
         )
 
         # Установка cookies
-        # Некоторые "служебные" cookies нужны, иначе аудио-страницы могут ломаться
-        self.cookies.setdefault("remixaudio_show_alert_today", "0")
-        self.cookies.setdefault("remixmdevice", "1920/1080/2/!!-!!!!")
-        for name, value in self.cookies.items():
-            self.session.cookies.set(name, value, domain=".vk.com")
+        # Поддерживаем 2 формата:
+        # - dict name->value (legacy)
+        # - {"_simple":{...}, "_items":[{name,value,domain,path,...}, ...]} (domain-aware)
+        cookie_items = None
+        if isinstance(self.cookies, dict) and "_items" in self.cookies and isinstance(self.cookies.get("_items"), list):
+            cookie_items = self.cookies.get("_items")
+            simple = self.cookies.get("_simple") if isinstance(self.cookies.get("_simple"), dict) else {}
+            self.cookies = simple  # keep legacy dict behavior for other code
+
+        # Some "служебные" cookies нужны, иначе аудио-страницы могут ломаться
+        if isinstance(self.cookies, dict):
+            self.cookies.setdefault("remixaudio_show_alert_today", "0")
+            self.cookies.setdefault("remixmdevice", "1920/1080/2/!!-!!!!")
+
+        if cookie_items:
+            for c in cookie_items:
+                name = c.get("name")
+                val = c.get("value")
+                if not name or val is None:
+                    continue
+                domain = c.get("domain") or ".vk.com"
+                path = c.get("path") or "/"
+                try:
+                    self.session.cookies.set(str(name), str(val), domain=domain, path=path)
+                except Exception:
+                    self.session.cookies.set(str(name), str(val), domain=".vk.com")
+        else:
+            for name, value in (self.cookies or {}).items():
+                self.session.cookies.set(name, value, domain=".vk.com")
 
         # Заголовки, которые используют моб. эндпоинты m.vk.com/audio
         self.m_headers = {
@@ -668,29 +695,46 @@ def get_cookies_from_browser(browser_type="chrome"):
 
 def get_cookies_from_file(filepath):
     """Получение cookies из JSON файла"""
-    cookies = {}
+    # New format: list of cookie objects with domains (preferred)
+    # Legacy format: dict name->value or list of {name,value}
+    cookies: Dict[str, str] = {}
+    cookie_items: List[Dict[str, Any]] = []
     try:
         with open(filepath, "r") as f:
             data = json.load(f)
             if isinstance(data, list):
                 for item in data:
                     if "name" in item and "value" in item:
-                        cookies[item["name"]] = item["value"]
+                        cookie_items.append(dict(item))
+                        # Keep a simple dict for checks and vk.com requests.
+                        # If duplicates exist across domains, vk.com cookie wins.
+                        name = item.get("name")
+                        val = item.get("value")
+                        dom = (item.get("domain") or "").lstrip(".")
+                        if name and val is not None:
+                            if not dom or "vk.com" in dom:
+                                cookies[str(name)] = str(val)
+                            elif str(name) not in cookies:
+                                cookies[str(name)] = str(val)
             elif isinstance(data, dict):
-                cookies = data
-        print(f"Загружено {len(cookies)} cookies из файла")
+                cookies = {str(k): str(v) for k, v in data.items()}
+                cookie_items = [{"name": k, "value": v, "domain": ".vk.com", "path": "/"} for k, v in cookies.items()]
+        print(f"Загружено {len(cookie_items) or len(cookies)} cookie-записей из файла (уникальных имён: {len(cookies)})")
     except Exception as e:
         print(f"Ошибка чтения cookies файла: {e}")
-    return cookies
+    return {"_simple": cookies, "_items": cookie_items}
 
 
 def save_cookies_to_file(cookies, filepath):
     """Сохранение cookies в JSON файл"""
     try:
         with open(filepath, "w") as f:
-            json.dump(
-                [{"name": k, "value": v} for k, v in cookies.items()], f, indent=2
-            )
+            if isinstance(cookies, dict) and "_items" in cookies:
+                json.dump(cookies["_items"], f, ensure_ascii=False, indent=2)
+            elif isinstance(cookies, dict):
+                json.dump([{"name": k, "value": v} for k, v in cookies.items()], f, ensure_ascii=False, indent=2)
+            else:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
         print(f"Cookies сохранены в {filepath}")
     except Exception as e:
         print(f"Ошибка сохранения cookies: {e}")
@@ -1341,18 +1385,34 @@ def load_cookies_via_cdp(devtools_http_base: str = "http://127.0.0.1:9222") -> d
     try:
         cdp_call(ws, "Network.enable", {}, call_id=1)
         res = cdp_call(ws, "Network.getAllCookies", {}, call_id=2)
-        cookies = {}
+        cookie_items: List[Dict[str, Any]] = []
+        cookies_simple: Dict[str, str] = {}
         for c in (res.get("cookies") or []):
             domain = c.get("domain") or ""
-            if "vk.com" not in domain:
+            if ("vk.com" not in domain) and ("vkvideo.ru" not in domain):
                 continue
             name = c.get("name")
             val = c.get("value")
             if name and val is not None:
-                cookies[name] = val
-        if cookies:
-            cookies["_source"] = "cdp"
-        return cookies
+                cookie_items.append(
+                    {
+                        "name": name,
+                        "value": val,
+                        "domain": c.get("domain"),
+                        "path": c.get("path") or "/",
+                        "secure": bool(c.get("secure")),
+                        "httpOnly": bool(c.get("httpOnly")),
+                        "expires": c.get("expires"),
+                    }
+                )
+                dom = (domain or "").lstrip(".")
+                if not dom or "vk.com" in dom:
+                    cookies_simple[str(name)] = str(val)
+                elif str(name) not in cookies_simple:
+                    cookies_simple[str(name)] = str(val)
+        if cookie_items:
+            cookies_simple["_source"] = "cdp"
+        return {"_simple": cookies_simple, "_items": cookie_items}
     finally:
         try:
             ws.close()
@@ -1398,14 +1458,19 @@ def load_or_create_cookies_json(cookies_path: str) -> dict:
         cookies = {}
         print("[LOG] CDP cookies не удалось получить:", e)
     if cookies:
-        src = cookies.pop("_source", "cdp")
-        print(f"[LOG] Автоматически получил cookies через CDP ({src}): {len(cookies)}")
-        print("[LOG] Cookie names:", ", ".join(sorted(cookies.keys())))
+        cookies_simple = cookies.get("_simple") if isinstance(cookies, dict) else None
+        cookies_items = cookies.get("_items") if isinstance(cookies, dict) else None
+        src = ""
+        if isinstance(cookies_simple, dict):
+            src = cookies_simple.pop("_source", "cdp")
+        print(f"[LOG] Автоматически получил cookies через CDP ({src or 'cdp'}): {len(cookies_items or [])}")
+        if isinstance(cookies_items, list):
+            print("[LOG] Cookie names:", ", ".join(sorted({c.get('name') for c in cookies_items if c.get('name')})))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w") as f:
                 json.dump(
-                    [{"name": k, "value": v} for k, v in cookies.items()],
+                    (cookies_items or []),
                     f,
                     ensure_ascii=False,
                     indent=2,
@@ -1472,6 +1537,9 @@ def cookies_look_complete(cookies: dict) -> Tuple[bool, str]:
     """
     if not cookies:
         return False, "cookies пустые"
+    # If passed composite structure, validate vk.com simple dict
+    if isinstance(cookies, dict) and "_simple" in cookies and isinstance(cookies.get("_simple"), dict):
+        cookies = cookies["_simple"]  # type: ignore[assignment]
     # VK меняет имя session cookie (remixsid, remixsid6, ...)
     has_session = any(k.startswith("remixsid") for k in cookies.keys())
     if not has_session:
@@ -1544,6 +1612,38 @@ def main():
         action="store_true",
         help="Enable debug logs (same as VK_DEBUG=1).",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=4,
+        help="Parallel downloads for audio (default: 4).",
+    )
+    parser.add_argument(
+        "--vkvideo-access-token",
+        default=None,
+        help="Optional vkvideo.ru access_token for api.vkvideo.ru (used to get clip titles). Can also be set via VKVIDEO_ACCESS_TOKEN env.",
+    )
+    parser.add_argument(
+        "--vkvideo-section-id",
+        default=None,
+        help="Optional section_id for catalog.getSection (used to get clip titles). Can also be set via VKVIDEO_SECTION_ID env.",
+    )
+    parser.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Only list items (videos/clips/playlists) and exit without downloading.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Non-interactive mode: download all listed items without prompting.",
+    )
+    parser.add_argument(
+        "--clip-desc",
+        action="store_true",
+        help="Fetch clip descriptions for selected items via yt-dlp metadata (no download).",
+    )
     args, _unknown = parser.parse_known_args()
 
     if args.debug:
@@ -1571,22 +1671,33 @@ def main():
 
     cookies_path = args.cookies_path
     cookies = {}
+    cookie_items: List[Dict[str, Any]] = []
     print("Авторизация: cookies (CDP/браузер), без логина/пароля.")
-    cookies = load_or_create_cookies_json(cookies_path)
-    if not cookies:
+    cookies_data = load_or_create_cookies_json(cookies_path)
+    if not cookies_data:
         print("[LOG] Cookies не получены. Завершение.")
         return
 
-    ok, reason = cookies_look_complete(cookies)
+    if isinstance(cookies_data, dict) and "_simple" in cookies_data and "_items" in cookies_data:
+        cookies = cookies_data.get("_simple") or {}
+        cookie_items = cookies_data.get("_items") or []
+    elif isinstance(cookies_data, dict):
+        cookies = cookies_data
+        cookie_items = [{"name": k, "value": v, "domain": ".vk.com", "path": "/"} for k, v in cookies.items() if not str(k).startswith("_")]
+    else:
+        cookies = {}
+        cookie_items = []
+
+    ok, reason = cookies_look_complete(cookies_data if isinstance(cookies_data, dict) else {})
     if not ok:
         print("[LOG] НЕ АВТОРИЗОВАН:", reason)
-        print("[LOG] Cookie names:", ", ".join(sorted(cookies.keys())))
+        print("[LOG] Cookie names:", ", ".join(sorted({c.get("name") for c in cookie_items if c.get("name")})))
         return
 
     # Сначала проверяем что cookies живые, без запроса группы
     print()
     print("[LOG] Проверка cookies...")
-    probe = VKAudioDownloader("-1", cookies=cookies, access_token=None)
+    probe = VKAudioDownloader("-1", cookies=cookies_data, access_token=None)
     ok, reason = cookies_seem_valid(probe.session)
     if not ok:
         print("[LOG] Cookies недействительны:", reason)
@@ -1604,7 +1715,7 @@ def main():
     # Инициализация загрузчика (cookies + группа)
     print()
     print("[LOG] Инициализация загрузчика...")
-    downloader = VKAudioDownloader(GROUP_ID, cookies=cookies, access_token=None)
+    downloader = VKAudioDownloader(GROUP_ID, cookies=cookies_data, access_token=None)
 
     print("[LOG] Проверка доступа к группе...")
     try:
@@ -1621,13 +1732,130 @@ def main():
     base_out = Path(args.out) if args.out else (Path.cwd() / "out" / group_slug)
     base_out.mkdir(parents=True, exist_ok=True)
 
+    def _vkvideo_handles() -> List[str]:
+        """
+        Build possible vkvideo.ru /@handle candidates from CLI group id.
+        """
+        s = (GROUP_ID or "").strip()
+        handles: List[str] = []
+        if not s:
+            return handles
+        if s.startswith("@"):
+            handles.append(s[1:])
+            return handles
+        # numeric / club123 / public123
+        if re.match(r"^-?\d+$", s) or s.lower().startswith("club") or s.lower().startswith("public"):
+            gid = abs(int(downloader.group_owner_id()))
+            handles.append(f"club{gid}")
+            handles.append(f"public{gid}")
+            handles.append(str(gid))
+            return handles
+        # screen name
+        handles.append(s)
+        return handles
+
+    def _is_generic_vk_title(t: str) -> bool:
+        tl = (t or "").strip().lower()
+        if not tl:
+            return True
+        bad = {
+            "video embed",
+            "vk видео — смотреть онлайн бесплатно",
+            "vk video",
+        }
+        return tl in bad
+
+    def fetch_vkvideo_title_map(wanted_keys: List[str]) -> Dict[str, str]:
+        """
+        Try to map video keys like '-179_456' -> human title using vkvideo.ru catalog HTML.
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        wanted = set(wanted_keys)
+        out: Dict[str, str] = {}
+
+        for h in _vkvideo_handles():
+            page_url = f"https://vkvideo.ru/@{h}/all"
+            try:
+                r = downloader.session.get(
+                    page_url,
+                    timeout=25,
+                    headers={
+                        "Referer": "https://vkvideo.ru/",
+                        "Origin": "https://vkvideo.ru",
+                    },
+                )
+                html = r.text or ""
+            except Exception as e:
+                if debug:
+                    print("[LOG] vkvideo fetch failed:", page_url, e)
+                continue
+
+            if debug:
+                print("[LOG] vkvideo:", page_url, "HTTP", getattr(r, "status_code", "?"), "len", len(html))
+                try:
+                    dbg = base_out / "_debug_titles" / f"vkvideo__{sanitize_filename(h, max_len=80)}__all.html"
+                    dbg.parent.mkdir(parents=True, exist_ok=True)
+                    dbg.write_text(html, encoding="utf-8", errors="ignore")
+                    print("[LOG] debug saved:", dbg)
+                except Exception:
+                    pass
+
+            # Fast path: find anchors to videos and nearby aria-label/title
+            for key in list(wanted):
+                if key in out and not _is_generic_vk_title(out.get(key, "")):
+                    continue
+                # href may be /video-... or https://vkvideo.ru/video-...
+                m = re.search(
+                    rf'(?is)href="[^"]*video{re.escape(key)}[^"]*"[^>]*?(?:aria-label|title)="([^"]+)"',
+                    html,
+                )
+                if not m:
+                    m = re.search(
+                        rf'(?is)(?:aria-label|title)="([^"]+)"[^>]*href="[^"]*video{re.escape(key)}[^"]*"',
+                        html,
+                    )
+                if m:
+                    title = _html.unescape(m.group(1)).strip()
+                    if title and not _is_generic_vk_title(title):
+                        out[key] = title
+
+            # JSON-ish fragments sometimes include md_title near video id
+            if wanted - set(out.keys()):
+                for key in list(wanted):
+                    if key in out and not _is_generic_vk_title(out.get(key, "")):
+                        continue
+                    m = re.search(rf'video{re.escape(key)}[\s\S]{{0,800}}?"md_title"\s*:\s*"([^"]+)"', html)
+                    if m:
+                        title = _html.unescape(m.group(1)).strip()
+                        if title and not _is_generic_vk_title(title):
+                            out[key] = title
+
+            # If we found something meaningful, stop trying other handle guesses
+            if out:
+                break
+
+        return out
+
     def cookies_to_netscape(cookie_path: Path):
         lines = ["# Netscape HTTP Cookie File\n"]
-        for name, value in cookies.items():
-            if not name or name.startswith("_"):
-                continue
-            # domain, include_subdomains, path, secure, expires, name, value
-            lines.append(f".vk.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+        # Prefer domain-aware cookie list
+        if cookie_items:
+            for c in cookie_items:
+                name = c.get("name")
+                value = c.get("value")
+                if not name or value is None:
+                    continue
+                domain = c.get("domain") or ".vk.com"
+                dom = str(domain).lstrip(".")
+                path = c.get("path") or "/"
+                secure = "TRUE" if c.get("secure") else "FALSE"
+                expires = "0"
+                lines.append(f".{dom}\tTRUE\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+        else:
+            for name, value in (cookies or {}).items():
+                if not name or name.startswith("_"):
+                    continue
+                lines.append(f".vk.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
         cookie_path.write_text("".join(lines), encoding="utf-8")
 
     def run_ytdlp(url: str, out_dir: Path):
@@ -1636,15 +1864,781 @@ def main():
         cookies_to_netscape(cookies_txt)
         # Prefer yt-dlp executable if installed; module requires Python >= 3.10 in recent versions.
         exe = shutil.which("yt-dlp")
+        ua = downloader.session.headers.get(
+            "User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+
+        def build_cmd(use_headers: bool) -> List[str]:
+            common = [
+                "--cookies",
+                str(cookies_txt),
+                "--user-agent",
+                ua,
+                "-P",
+                str(out_dir),
+                "-o",
+                "%(title).200s [%(id)s].%(ext)s",
+            ]
+            if use_headers:
+                common += [
+                    "--add-header",
+                    "Referer:https://vk.com/",
+                    "--add-header",
+                    "Origin:https://vk.com",
+                    "--add-header",
+                    "Accept-Language:ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                ]
+            if exe:
+                return [exe] + common + [url]
+            return [sys.executable, "-m", "yt_dlp"] + common + [url]
+
+        # Log yt-dlp version for debugging (old versions often fall back to generic extractor)
+        try:
+            ver_cmd = [exe, "--version"] if exe else [sys.executable, "-m", "yt_dlp", "--version"]
+            ver = subprocess.run(ver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout.strip()
+            if ver:
+                print("[LOG] yt-dlp version:", ver)
+        except Exception:
+            pass
+
+        print("[LOG] yt-dlp:", url)
+        # First try with extra headers (helps avoid vk.com/badbrowser.php redirects)
+        cmd = build_cmd(use_headers=True)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out = (p.stdout or "").strip()
+        if out:
+            # keep it compact in normal mode
+            print(out)
+        if p.returncode != 0:
+            lower = out.lower()
+            if "badbrowser.php" in lower or "unsupported url" in lower or "falling back on generic" in lower:
+                print("[LOG] yt-dlp не смог обработать URL (badbrowser/generic). Пробую ещё раз без доп. заголовков...")
+                cmd2 = build_cmd(use_headers=False)
+                p2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                out2 = (p2.stdout or "").strip()
+                if out2:
+                    print(out2)
+                if p2.returncode != 0:
+                    print("[LOG] yt-dlp failed with code", p2.returncode)
+                    return
+            else:
+                print("[LOG] yt-dlp failed with code", p.returncode)
+            return
+
+    def _fetch_text(url: str) -> str:
+        try:
+            r = downloader.session.get(url, timeout=20)
+            return r.text or ""
+        except Exception:
+            return ""
+
+    def _post_al(path: str, data: Dict[str, Any], referer: str) -> Tuple[int, str]:
+        """
+        VK internal AJAX endpoints (al_*.php) often return payload-like text.
+        We don't try to fully parse it; we extract ids via regex.
+        """
+        try:
+            headers = {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "*/*",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://vk.com",
+                "Referer": referer,
+            }
+            r = downloader.session.post(
+                f"https://vk.com/{path}",
+                data=data,
+                headers=headers,
+                timeout=25,
+            )
+            return int(getattr(r, "status_code", 0) or 0), (r.text or "")
+        except Exception as e:
+            return 0, ""
+
+    def _vkvideo_web_token(app_id: str = "52461373") -> str:
+        """
+        Obtain vkvideo web access_token via cookies:
+        POST https://vkvideo.ru/al_video.php?act=web_token (version=1&app_id=...)
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        try:
+            r = downloader.session.post(
+                "https://vkvideo.ru/al_video.php?act=web_token",
+                data={"version": "1", "app_id": str(app_id)},
+                headers={
+                    "Accept": "*/*",
+                    "Origin": "https://vkvideo.ru",
+                    "Referer": "https://vkvideo.ru/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=20,
+            )
+            text = r.text or ""
+            if debug:
+                print("[LOG] vkvideo web_token HTTP", getattr(r, "status_code", "?"), "len", len(text))
+                try:
+                    dbg = base_out / "_debug_titles" / "vkvideo_web_token__raw.txt"
+                    dbg.parent.mkdir(parents=True, exist_ok=True)
+                    dbg.write_text(text, encoding="utf-8", errors="ignore")
+                except Exception:
+                    pass
+        except Exception as e:
+            if debug:
+                print("[LOG] vkvideo web_token failed:", e)
+            return ""
+
+        # Try json first
+        try:
+            j = r.json()
+            if isinstance(j, dict):
+                tok = (j.get("access_token") or j.get("token") or j.get("response", {}).get("access_token") or "").strip()
+                if tok.startswith("vk1."):
+                    return tok
+        except Exception:
+            pass
+
+        # Fallback: regex in text
+        m = re.search(r'"access_token"\s*:\s*"([^"]+)"', text)
+        if m:
+            tok = m.group(1).strip()
+            if tok.startswith("vk1."):
+                return tok
+        m = re.search(r"\bvk1\.[A-Za-z0-9._-]+\b", text)
+        if m:
+            return m.group(0)
+        return ""
+
+    def _vkvideo_find_section_id(access_token: str, want_title: str = "Клипы") -> str:
+        """
+        Try to discover section_id via api.vkvideo.ru catalog.getVideoShowcase.
+        vkvideo.ru itself calls it with url=https://vkvideo.ru/sidebar&need_blocks=1&access_token=...
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        url = "https://api.vkvideo.ru/method/catalog.getVideoShowcase"
+        params = {"v": "5.275", "client_id": "52461373"}
+        headers = {
+            "Accept": "*/*",
+            "Origin": "https://vkvideo.ru",
+            "Referer": "https://vkvideo.ru/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            r = downloader.session.post(
+                url,
+                params=params,
+                data={"url": "https://vkvideo.ru/sidebar", "need_blocks": "1", "access_token": access_token},
+                headers=headers,
+                timeout=25,
+            )
+            text = r.text or ""
+        except Exception as e:
+            if debug:
+                print("[LOG] vkvideo showcase failed:", e)
+            return ""
+
+        if debug:
+            print("[LOG] vkvideo showcase HTTP", getattr(r, "status_code", "?"), "len", len(text))
+            try:
+                dbg = base_out / "_debug_titles" / "vkvideo_api__catalog.getVideoShowcase.json"
+                dbg.parent.mkdir(parents=True, exist_ok=True)
+                dbg.write_text(text, encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        try:
+            data = r.json()
+        except Exception:
+            return ""
+
+        # normalize: {"response": {...}} or top-level
+        root = data.get("response") if isinstance(data, dict) and isinstance(data.get("response"), dict) else data
+
+        def iter_dicts(x):
+            if isinstance(x, dict):
+                yield x
+                for v in x.values():
+                    for y in iter_dicts(v):
+                        yield y
+            elif isinstance(x, list):
+                for it in x:
+                    for y in iter_dicts(it):
+                        yield y
+
+        want = (want_title or "").strip().lower()
+        # Heuristic: find dict with id + title/breadcrumbs label "Клипы"
+        for d in iter_dicts(root):
+            if not isinstance(d, dict):
+                continue
+            sid = d.get("id")
+            if not (isinstance(sid, str) and sid):
+                continue
+            title = (d.get("title") or "").strip().lower()
+            if title and want and title == want:
+                return sid
+            crumbs = d.get("breadcrumbs")
+            if isinstance(crumbs, list) and crumbs:
+                for c in crumbs:
+                    if isinstance(c, dict) and (c.get("label") or "").strip().lower() == want:
+                        return sid
+
+        # Fallback: first dict that looks like a section with title containing want
+        for d in iter_dicts(root):
+            sid = d.get("id")
+            if not (isinstance(sid, str) and sid):
+                continue
+            title = (d.get("title") or "").strip().lower()
+            if want and title and want in title:
+                return sid
+        return ""
+
+    def _vkvideo_get_showcase(access_token: str, url_value: str) -> Dict[str, Any]:
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        url = "https://api.vkvideo.ru/method/catalog.getVideoShowcase"
+        params = {"v": "5.275", "client_id": "52461373"}
+        headers = {
+            "Accept": "*/*",
+            "Origin": "https://vkvideo.ru",
+            "Referer": "https://vkvideo.ru/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            r = downloader.session.post(
+                url,
+                params=params,
+                data={"url": url_value, "need_blocks": "1", "access_token": access_token},
+                headers=headers,
+                timeout=25,
+            )
+            text = r.text or ""
+        except Exception as e:
+            if debug:
+                print("[LOG] vkvideo showcase failed:", e)
+            return {}
+        if debug:
+            try:
+                dbg = base_out / "_debug_titles" / f"vkvideo_api__showcase__{sanitize_filename(url_value, max_len=80)}.json"
+                dbg.parent.mkdir(parents=True, exist_ok=True)
+                dbg.write_text(text, encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+        try:
+            return r.json() if isinstance(r.json(), dict) else {}
+        except Exception:
+            return {}
+
+    def _vkvideo_pick_section_id_from_showcase(showcase: Dict[str, Any], owner_id: int, want_titles: List[str]) -> str:
+        """
+        Heuristic: walk showcase JSON and find a section_id/id that belongs to this owner_id
+        and matches one of the wanted titles (case-insensitive). Returns best candidate or "".
+        """
+        if not isinstance(showcase, dict):
+            return ""
+        root = showcase.get("response") if isinstance(showcase.get("response"), dict) else showcase
+        if not isinstance(root, dict):
+            return ""
+
+        want = {w.strip().lower() for w in (want_titles or []) if w and w.strip()}
+
+        def iter_dicts(x):
+            if isinstance(x, dict):
+                yield x
+                for v in x.values():
+                    for y in iter_dicts(v):
+                        yield y
+            elif isinstance(x, list):
+                for it in x:
+                    for y in iter_dicts(it):
+                        yield y
+
+        candidates: List[Tuple[int, str]] = []  # (score, section_id)
+        for d in iter_dicts(root):
+            if not isinstance(d, dict):
+                continue
+            # must be related to owner_id
+            layout = d.get("layout")
+            oid = None
+            if isinstance(layout, dict):
+                oid = layout.get("owner_id")
+            if oid != owner_id:
+                continue
+            # find any plausible section id in this dict
+            sid = ""
+            for k in ("section_id", "id"):
+                v = d.get(k)
+                if isinstance(v, str) and v and v.startswith("PU"):
+                    sid = v
+                    break
+            if not sid:
+                continue
+            # score by title match if present
+            score = 1
+            t = (d.get("title") or "").strip().lower()
+            if t and t in want:
+                score += 10
+            crumbs = d.get("breadcrumbs")
+            if isinstance(crumbs, list):
+                for c in crumbs:
+                    if isinstance(c, dict) and (c.get("label") or "").strip().lower() in want:
+                        score += 10
+                        break
+            candidates.append((score, sid))
+
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    def _vkvideo_find_section_id_for_url(access_token: str, url_value: str, want_title: str) -> str:
+        """
+        Same as _vkvideo_find_section_id, but allows custom url=... (e.g. https://vkvideo.ru/@handle/all).
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        url = "https://api.vkvideo.ru/method/catalog.getVideoShowcase"
+        params = {"v": "5.275", "client_id": "52461373"}
+        headers = {
+            "Accept": "*/*",
+            "Origin": "https://vkvideo.ru",
+            "Referer": "https://vkvideo.ru/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            r = downloader.session.post(
+                url,
+                params=params,
+                data={"url": url_value, "need_blocks": "1", "access_token": access_token},
+                headers=headers,
+                timeout=25,
+            )
+            text = r.text or ""
+        except Exception as e:
+            if debug:
+                print("[LOG] vkvideo showcase failed:", e)
+            return ""
+
+        if debug:
+            print("[LOG] vkvideo showcase:", url_value, "HTTP", getattr(r, "status_code", "?"), "len", len(text))
+            try:
+                dbg = base_out / "_debug_titles" / f"vkvideo_api__showcase__{sanitize_filename(url_value, max_len=80)}.json"
+                dbg.parent.mkdir(parents=True, exist_ok=True)
+                dbg.write_text(text, encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        try:
+            data = r.json()
+        except Exception:
+            return ""
+
+        root = data.get("response") if isinstance(data, dict) and isinstance(data.get("response"), dict) else data
+
+        def iter_dicts(x):
+            if isinstance(x, dict):
+                yield x
+                for v in x.values():
+                    for y in iter_dicts(v):
+                        yield y
+            elif isinstance(x, list):
+                for it in x:
+                    for y in iter_dicts(it):
+                        yield y
+
+        want = (want_title or "").strip().lower()
+        for d in iter_dicts(root):
+            if not isinstance(d, dict):
+                continue
+            sid = d.get("id")
+            if not (isinstance(sid, str) and sid):
+                continue
+            title = (d.get("title") or "").strip().lower()
+            if title and want and title == want:
+                return sid
+            crumbs = d.get("breadcrumbs")
+            if isinstance(crumbs, list) and crumbs:
+                for c in crumbs:
+                    if isinstance(c, dict) and (c.get("label") or "").strip().lower() == want:
+                        return sid
+        for d in iter_dicts(root):
+            sid = d.get("id")
+            if not (isinstance(sid, str) and sid):
+                continue
+            title = (d.get("title") or "").strip().lower()
+            if want and title and want in title:
+                return sid
+        return ""
+
+    def _fetch_vkvideo_clips_catalog(
+        owner_id: int, section_id: Optional[str], access_token: Optional[str]
+    ) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+        """
+        Best source of clip titles: api.vkvideo.ru catalog.getSection (cookie-based session + optional token).
+        Returns (ids_in_order, title_map, desc_map) where ids are keys like "-oid_id".
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        url = "https://api.vkvideo.ru/method/catalog.getSection"
+        params = {
+            "v": "5.275",
+            "client_id": "52461373",
+        }
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://vkvideo.ru",
+            "Referer": "https://vkvideo.ru/",
+        }
+        try:
+            if section_id and access_token:
+                # This matches what vkvideo.ru XHR does: POST form-data with section_id + access_token.
+                r = downloader.session.post(
+                    url,
+                    params=params,
+                    data={"section_id": section_id, "access_token": access_token},
+                    headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=25,
+                )
+            else:
+                # Fallback: sometimes returns a useful section without explicit token.
+                r = downloader.session.get(url, params=params, headers=headers, timeout=25)
+            text = r.text or ""
+        except Exception as e:
+            if debug:
+                print("[LOG] vkvideo api failed:", e)
+            return [], {}, {}
+
+        if debug:
+            print("[LOG] vkvideo api:", url, "HTTP", getattr(r, "status_code", "?"), "len", len(text))
+            try:
+                dbg = base_out / "_debug_titles" / "vkvideo_api__catalog.getSection.json"
+                dbg.parent.mkdir(parents=True, exist_ok=True)
+                dbg.write_text(text, encoding="utf-8", errors="ignore")
+                print("[LOG] debug saved:", dbg)
+            except Exception:
+                pass
+
+        try:
+            data = r.json()
+        except Exception:
+            return [], {}, {}
+
+        # Response may be {"section": {...}} or {"response": {"section": {...}}}
+        section = None
+        if isinstance(data, dict):
+            section = data.get("section")
+            if section is None and isinstance(data.get("response"), dict):
+                section = data["response"].get("section")
+        if not isinstance(section, dict):
+            return [], {}, {}
+
+        ids_in_order: List[str] = []
+        title_map: Dict[str, str] = {}
+        desc_map: Dict[str, str] = {}
+
+        # Prefer explicit order from videos_ids if present.
+        vids = section.get("videos_ids")
+        if isinstance(vids, list):
+            for x in vids:
+                if isinstance(x, str) and re.match(r"^-?\d+_\d+$", x.strip()):
+                    ids_in_order.append(x.strip())
+
+        videos = section.get("videos")
+        if isinstance(videos, list):
+            for v in videos:
+                if not isinstance(v, dict):
+                    continue
+                oid = v.get("owner_id")
+                vid = v.get("id")
+                if not (isinstance(oid, int) and isinstance(vid, int)):
+                    continue
+                if oid != owner_id:
+                    continue
+                key = f"{oid}_{vid}"
+                t = (v.get("title") or "").strip()
+                if t and not _is_generic_vk_title(t):
+                    title_map[key] = t
+                dsc = (v.get("description") or "").strip()
+                if dsc:
+                    desc_map[key] = dsc
+                if key not in ids_in_order:
+                    ids_in_order.append(key)
+
+        # If api returned items for a different owner (e.g. not logged / wrong context), ignore.
+        # Keep only ids matching our owner_id.
+        ids_in_order = [k for k in ids_in_order if k.startswith(f"{owner_id}_")]
+        if not ids_in_order:
+            return [], {}, {}
+        return ids_in_order, title_map, desc_map
+
+    def _fetch_vkvideo_titles_for_owner(owner_id: int, want_title: str) -> Dict[str, str]:
+        """
+        Fetch titles for a given owner_id and section ("Видео"/"Клипы") via vkvideo API.
+        Returns key "-oid_id" -> title for items returned by that section.
+        """
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        access_token = args.vkvideo_access_token or os.environ.get("VKVIDEO_ACCESS_TOKEN")
+        if not access_token:
+            access_token = _vkvideo_web_token("52461373")
+            if debug and access_token:
+                print("[LOG] vkvideo: получил web_token по cookies (titles).")
+        if not access_token:
+            return {}
+
+        # Primary: sidebar showcase (stable) + owner_id filtering.
+        showcase = _vkvideo_get_showcase(access_token, "https://vkvideo.ru/sidebar")
+        section_id = _vkvideo_pick_section_id_from_showcase(
+            showcase,
+            owner_id=owner_id,
+            want_titles=[want_title, "Видеозаписи", "Все видео", "Видео", "Клипы", "Clips", "Videos"],
+        )
+        if not section_id:
+            # Secondary: try handle page (sometimes 104 Not found; keep as fallback)
+            for h in _vkvideo_handles():
+                showcase_url = f"https://vkvideo.ru/@{h}/all"
+                section_id = _vkvideo_find_section_id_for_url(access_token, showcase_url, want_title=want_title)
+                if section_id:
+                    break
+        if not section_id:
+            return {}
+            # Fetch section
+            try:
+                r = downloader.session.post(
+                    "https://api.vkvideo.ru/method/catalog.getSection",
+                    params={"v": "5.275", "client_id": "52461373"},
+                    data={"section_id": section_id, "access_token": access_token},
+                    headers={
+                        "Accept": "application/json, text/plain, */*",
+                        "Origin": "https://vkvideo.ru",
+                        "Referer": "https://vkvideo.ru/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    timeout=25,
+                )
+                text = r.text or ""
+                if debug:
+                    try:
+                        dbg = base_out / "_debug_titles" / f"vkvideo_api__catalog.getSection__{sanitize_filename(want_title, max_len=30)}.json"
+                        dbg.parent.mkdir(parents=True, exist_ok=True)
+                        dbg.write_text(text, encoding="utf-8", errors="ignore")
+                    except Exception:
+                        pass
+                data = r.json()
+            except Exception:
+                return {}
+            section = None
+            if isinstance(data, dict):
+                section = data.get("section")
+                if section is None and isinstance(data.get("response"), dict):
+                    section = data["response"].get("section")
+            if not isinstance(section, dict):
+                return {}
+            videos = section.get("videos")
+            if not isinstance(videos, list):
+                return {}
+            out: Dict[str, str] = {}
+            for v in videos:
+                if not isinstance(v, dict):
+                    continue
+                oid = v.get("owner_id")
+                vid = v.get("id")
+                if not (isinstance(oid, int) and isinstance(vid, int)):
+                    continue
+                if oid != owner_id:
+                    continue
+                title = (v.get("title") or "").strip()
+                if title and not _is_generic_vk_title(title):
+                    out[f"{oid}_{vid}"] = title
+            return out
+
+    def _iter_unique_ids(pattern: str, text: str) -> List[str]:
+        # Returns strings like "-123_456"
+        seen = set()
+        out = []
+        for m in re.finditer(pattern, text):
+            oid = m.group(1)
+            vid = m.group(2)
+            key = f"{oid}_{vid}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    def _extract_titles_from_payload(kind: str, payload: str) -> Dict[str, str]:
+        """
+        Best-effort title extraction from VK al_*.php payloads.
+        Returns mapping key ("-oid_id") -> title.
+        """
+        if not payload:
+            return {}
+        out: Dict[str, str] = {}
+
+        # 1) JSON payload path: many endpoints return {"payload":[...]} with lists like
+        #    [-oid, id, preview_url, "Title", ...]
+        try:
+            if payload.lstrip().startswith("{") and len(payload) < 20_000_000:
+                j = json.loads(payload)
+
+                def walk(x):
+                    if isinstance(x, list):
+                        # Candidate tuple: [owner_id, id, <str>, <title str>, ...]
+                        if len(x) >= 4 and isinstance(x[0], int) and isinstance(x[1], int) and isinstance(x[3], str):
+                            oid = x[0]
+                            vid = x[1]
+                            title = _html.unescape(x[3]).strip()
+                            if title:
+                                tl = title.lower()
+                                if tl not in {"video embed", "vk видео — смотреть онлайн бесплатно", "vk video"}:
+                                    out[f"{oid}_{vid}"] = title
+                        for it in x:
+                            walk(it)
+                    elif isinstance(x, dict):
+                        for v in x.values():
+                            walk(v)
+
+                walk(j)
+        except Exception:
+            pass
+
+        # Common attributes in rendered snippets
+        patterns = [
+            # ... video-123_456 ... aria-label="Some title"
+            rf'{kind}(-?\d+)_(\d+)[^<>\n]{{0,400}}?aria-label="([^"]+)"',
+            rf'{kind}(-?\d+)_(\d+)[^<>\n]{{0,400}}?title="([^"]+)"',
+            # data-title="Some title"
+            rf'{kind}(-?\d+)_(\d+)[^<>\n]{{0,400}}?data-title="([^"]+)"',
+            # JS-ish: "title":"Some title"
+            rf'{kind}(-?\d+)_(\d+)[^<>\n]{{0,400}}?"title"\s*:\s*"([^"]+)"',
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, payload, re.I):
+                key = f"{m.group(1)}_{m.group(2)}"
+                title = _html.unescape(m.group(3)).strip()
+                if not title:
+                    continue
+                # Avoid generic wrappers
+                tl = title.lower()
+                if tl in {"video embed", "vk видео — смотреть онлайн бесплатно", "vk video"}:
+                    continue
+                if key not in out:
+                    out[key] = title
+        return out
+
+    def _extract_vk_og_title(html: str) -> str:
+        # Prefer og:title; fallback to <title>.
+        if not html:
+            return ""
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', html, re.I)
+        if m:
+            return _html.unescape(m.group(1)).strip()
+        m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+        if m:
+            t = re.sub(r"\s+", " ", m.group(1))
+            return _html.unescape(t).strip()
+        return ""
+
+    def _extract_vk_og_description(html: str) -> str:
+        if not html:
+            return ""
+        m = re.search(
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+            html,
+            re.I,
+        )
+        if not m:
+            m = re.search(
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+                html,
+                re.I,
+            )
+        if m:
+            return _html.unescape(m.group(1)).strip()
+        return ""
+
+    def _debug_save_html(name: str, html_text: str):
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        if not debug or not html_text:
+            return
+        try:
+            dbg_dir = base_out / "_debug_titles"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            p = dbg_dir / f"{sanitize_filename(name, max_len=120)}.html"
+            p.write_text(html_text, encoding="utf-8", errors="ignore")
+            print("[LOG] debug saved:", p)
+        except Exception as e:
+            print("[LOG] debug save failed:", e)
+
+    def _debug_title_candidates(label: str, html_text: str):
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        if not debug or not html_text:
+            return
+        og = _extract_vk_og_title(html_text)
+        md = ""
+        mv = ""
+        # VK player params sometimes have md_title / mvData.title
+        m = re.search(r'"md_title"\s*:\s*"([^"]+)"', html_text)
+        if m:
+            md = _html.unescape(m.group(1))
+        m = re.search(r'"mvData"\s*:\s*\{[^}]*"title"\s*:\s*"([^"]+)"', html_text)
+        if m:
+            mv = _html.unescape(m.group(1))
+        if og or md or mv:
+            print(f"[LOG] title candidates {label}: og={og!r} md_title={md!r} mvData.title={mv!r}")
+        else:
+            # print a short hint where og:title might be absent
+            head = re.sub(r"\s+", " ", html_text[:300])
+            print(f"[LOG] title candidates {label}: none. head={head!r}")
+
+    def _get_vk_media_title(kind: str, key: str) -> str:
+        # kind: "video" or "clip", key: "-oid_id"
+        try:
+            # Prefer embed page for videos/clips: it tends to contain real title without vkvideo wrappers
+            if "_" in key:
+                oid_s, id_s = key.split("_", 1)
+                if oid_s.lstrip("-").isdigit() and id_s.isdigit():
+                    embed_url = f"https://vk.com/video_ext.php?oid={oid_s}&id={id_s}&hd=2"
+                    embed = _fetch_text(embed_url)
+                    _debug_save_html(f"{kind}{key}__embed", embed)
+                    _debug_title_candidates(f"{kind}{key} embed", embed)
+                    t = _extract_vk_og_title(embed)
+                    if t and "vk видео" not in t.lower() and "vk video" not in t.lower():
+                        return t
+
+            page_url = f"https://vk.com/{kind}{key}"
+            page = _fetch_text(page_url)
+            _debug_save_html(f"{kind}{key}__page", page)
+            _debug_title_candidates(f"{kind}{key} page", page)
+            title = _extract_vk_og_title(page)
+            if title:
+                return title
+            return ""
+        except Exception:
+            return ""
+
+    def ytdlp_metadata(url: str) -> Dict[str, Any]:
+        """
+        Get metadata without downloading (yt-dlp --dump-single-json --skip-download).
+        """
+        cookies_txt = base_out / "cookies.txt"
+        cookies_to_netscape(cookies_txt)
+        exe = shutil.which("yt-dlp")
+        ua = downloader.session.headers.get(
+            "User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        cmd: List[str]
         if exe:
             cmd = [
                 exe,
                 "--cookies",
                 str(cookies_txt),
-                "-P",
-                str(out_dir),
-                "-o",
-                "%(title).200s [%(id)s].%(ext)s",
+                "--user-agent",
+                ua,
+                "--add-header",
+                "Referer:https://vk.com/",
+                "--add-header",
+                "Origin:https://vk.com",
+                "--skip-download",
+                "--dump-single-json",
                 url,
             ]
         else:
@@ -1654,22 +2648,383 @@ def main():
                 "yt_dlp",
                 "--cookies",
                 str(cookies_txt),
-                "-P",
-                str(out_dir),
-                "-o",
-                "%(title).200s [%(id)s].%(ext)s",
+                "--user-agent",
+                ua,
+                "--add-header",
+                "Referer:https://vk.com/",
+                "--add-header",
+                "Origin:https://vk.com",
+                "--skip-download",
+                "--dump-single-json",
                 url,
             ]
-        print("[LOG] yt-dlp:", url)
-        p = subprocess.run(cmd)
-        if p.returncode != 0:
-            print("[LOG] yt-dlp failed with code", p.returncode)
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if p.returncode != 0:
+                return {}
+            j = json.loads(p.stdout or "{}")
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+
+    def _fmt_title_for_list(title: str, max_len: int = 90) -> str:
+        t = (title or "").strip()
+        if not t:
+            return ""
+        t = re.sub(r"\s+", " ", t)
+        return (t[: max_len - 1] + "…") if len(t) > max_len else t
+
+    def _select_indices(total: int) -> List[int]:
+        """
+        Returns 0-based indices selected by user.
+        Supports: all/y, n/no/нет, 1,2,5-10
+        """
+        print()
+        print("Что скачать?")
+        print("- all / y  : всё")
+        print("- n        : ничего (выход)")
+        print("- 1,2,5-10 : номера")
+        sel = (input(">> ").strip() or "all").lower()
+        if sel in {"n", "no", "нет"}:
+            return []
+        if sel in {"all", "y", "yes", "да"}:
+            return list(range(total))
+        indices: List[int] = []
+        try:
+            for part in (sel or "").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    a, b = map(int, part.split("-", 1))
+                    for x in range(a, b + 1):
+                        if 1 <= x <= total:
+                            indices.append(x - 1)
+                else:
+                    x = int(part)
+                    if 1 <= x <= total:
+                        indices.append(x - 1)
+        except Exception:
+            return []
+        # unique, keep order
+        seen = set()
+        out: List[int] = []
+        for i in indices:
+            if i in seen:
+                continue
+            seen.add(i)
+            out.append(i)
+        return out
+
+    def download_group_videos_web(owner_id: int):
+        # Listing pages are unstable for yt-dlp; scrape IDs and download direct video URLs.
+        url = f"https://vk.com/videos{owner_id}"
+        html = _fetch_text(url)
+        ids = _iter_unique_ids(r"video(-?\d+)_(\d+)", html)
+        titles: Dict[str, str] = {}
+        if not ids:
+            # Fallback: use internal AJAX endpoint used by the site itself.
+            # This tends to work even when HTML is mostly scripts.
+            print("[LOG] HTML videos пустой/без id. Пробую al_video.php (silent load)...")
+            seen = set()
+            offset = 0
+            # 'section' can be 'all' for group/channel videos
+            while True:
+                st, payload = _post_al(
+                    "al_video.php",
+                    {
+                        "act": "load_videos_silent",
+                        "oid": str(owner_id),
+                        "offset": str(offset),
+                        "section": "all",
+                        "al": "1",
+                        "need_albums": "0",
+                        "rowlen": "3",
+                        "snippet_video": "0",
+                    },
+                    referer=url,
+                )
+                debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+                if debug and payload and offset == 0:
+                    try:
+                        dbg = base_out / "_debug_titles" / "al_video__load_videos_silent__offset0.txt"
+                        dbg.parent.mkdir(parents=True, exist_ok=True)
+                        dbg.write_text(payload, encoding="utf-8", errors="ignore")
+                        print("[LOG] debug saved:", dbg)
+                    except Exception:
+                        pass
+                if st and st >= 400:
+                    if debug:
+                        print(f"[LOG] al_video.php HTTP {st} (offset={offset}) head:", payload[:200].replace("\n", " "))
+                titles.update(_extract_titles_from_payload("video", payload))
+                batch = _iter_unique_ids(r"video(-?\d+)_(\d+)", payload)
+                new = [x for x in batch if x not in seen]
+                for x in new:
+                    seen.add(x)
+                if not new:
+                    break
+                ids.extend(new)
+                offset += len(new)
+                if offset > 10000:
+                    break
+
+        if not ids:
+            print("[LOG] Не удалось найти video-oid_id (ни HTML, ни al_video.php).")
+            return
+        out_dir = base_out / "videos"
+        print(f"[LOG] Найдено видео: {len(ids)}")
+        print("[LOG] Получаю названия...")
+        vk_api_map = _fetch_vkvideo_titles_for_owner(owner_id, want_title="Видео")
+        if vk_api_map:
+            merged = 0
+            for k, t in vk_api_map.items():
+                if not t:
+                    continue
+                cur = titles.get(k, "")
+                if (not cur) or _is_generic_vk_title(cur):
+                    titles[k] = t
+                    merged += 1
+            print(f"[LOG] vkvideo API titles: {merged}/{len(ids)}")
+        else:
+            # Legacy HTML heuristic as last resort
+            vk_map = fetch_vkvideo_title_map(ids)
+            if vk_map:
+                merged = 0
+                for k, t in vk_map.items():
+                    if not t:
+                        continue
+                    cur = titles.get(k, "")
+                    if (not cur) or _is_generic_vk_title(cur):
+                        titles[k] = t
+                        merged += 1
+                print(f"[LOG] vkvideo.ru titles: {merged}/{len(ids)}")
+        items: List[Dict[str, str]] = []
+        for k in ids:
+            title = titles.get(k) or _get_vk_media_title("video", k)
+            items.append({"key": k, "title": title})
+        for i, it in enumerate(items, 1):
+            t = _fmt_title_for_list(it.get("title", ""))
+            if t:
+                print(f"{i:3d}. {t} [video{it['key']}]")
+            else:
+                print(f"{i:3d}. video{it['key']}")
+        if args.list_only:
+            return
+        chosen: Optional[List[int]] = None
+        if sys.stdin.isatty():
+            chosen = _select_indices(len(items))
+            if not chosen:
+                print("[LOG] Отмена.")
+                return
+        else:
+            if not args.yes:
+                print("[LOG] stdin не TTY. Чтобы скачать всё без вопросов, добавь --yes. Сейчас только показал список.")
+                return
+            chosen = list(range(len(items)))
+        for idx in chosen:
+            k = items[idx]["key"]
+            run_ytdlp(f"https://vk.com/video{k}", out_dir)
+
+    def download_group_clips_web(owner_id: int):
+        # /clips{owner} is usually not matched by yt-dlp; scrape clip IDs and download direct clip URLs.
+        vkvideo_access_token = args.vkvideo_access_token or os.environ.get("VKVIDEO_ACCESS_TOKEN")
+        vkvideo_section_id = args.vkvideo_section_id or os.environ.get("VKVIDEO_SECTION_ID")
+        if not vkvideo_access_token:
+            vkvideo_access_token = _vkvideo_web_token("52461373")
+            if vkvideo_access_token:
+                print("[LOG] vkvideo: получил web_token по cookies.")
+            else:
+                print("[LOG] vkvideo: не удалось получить web_token по cookies.")
+        if vkvideo_access_token and not vkvideo_section_id:
+            # First try dedicated clips showcase URL; it often contains owner-specific sections.
+            showcase = _vkvideo_get_showcase(vkvideo_access_token, "https://vkvideo.ru/clips")
+            vkvideo_section_id = _vkvideo_pick_section_id_from_showcase(
+                showcase,
+                owner_id=owner_id,
+                want_titles=["Клипы", "Clips"],
+            )
+            # Try handle-specific urls (some accounts get 104 on /all).
+            if not vkvideo_section_id:
+                for h in _vkvideo_handles():
+                    for u in (f"https://vkvideo.ru/@{h}/clips", f"https://vkvideo.ru/@{h}"):
+                        showcase_h = _vkvideo_get_showcase(vkvideo_access_token, u)
+                        vkvideo_section_id = _vkvideo_pick_section_id_from_showcase(
+                            showcase_h,
+                            owner_id=owner_id,
+                            want_titles=["Клипы", "Clips"],
+                        )
+                        if vkvideo_section_id:
+                            break
+                    if vkvideo_section_id:
+                        break
+            if not vkvideo_section_id:
+                vkvideo_section_id = _vkvideo_find_section_id(vkvideo_access_token, want_title="Клипы")
+            if vkvideo_section_id:
+                print("[LOG] vkvideo: нашёл section_id для 'Клипы'.")
+            else:
+                print("[LOG] vkvideo: не удалось найти section_id (showcase).")
+
+        api_ids, api_titles, api_desc = _fetch_vkvideo_clips_catalog(owner_id, vkvideo_section_id, vkvideo_access_token)
+        titles: Dict[str, str] = {}
+        descs: Dict[str, str] = {}
+        ids: List[str] = []
+        if api_ids:
+            ids = list(api_ids)
+            titles.update(api_titles)
+            descs.update(api_desc)
+            print(f"[LOG] vkvideo API: клипов {len(api_ids)}, titles {len(api_titles)}, desc {len(api_desc)}")
+
+        url = f"https://vk.com/clips{owner_id}"
+        html = _fetch_text(url)
+        more = _iter_unique_ids(r"clip(-?\d+)_(\d+)", html)
+        if more:
+            # merge, keep order
+            seen = set(ids)
+            for k in more:
+                if k not in seen:
+                    ids.append(k)
+                    seen.add(k)
+        if not ids:
+            # some pages reference clip as clip-oid_id
+            ids = _iter_unique_ids(r"clip-(-?\d+)_(\d+)", html)
+        if not ids:
+            print("[LOG] HTML clips пустой/без id. Пробую al_clips.php (silent load)...")
+            seen = set()
+            offset = 0
+            while True:
+                st, payload = _post_al(
+                    "al_clips.php",
+                    {
+                        "act": "load_clips_silent",
+                        "oid": str(owner_id),
+                        "offset": str(offset),
+                        "al": "1",
+                    },
+                    referer=url,
+                )
+                if st and st >= 400:
+                    debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+                    if debug:
+                        print(f"[LOG] al_clips.php HTTP {st} (offset={offset}) head:", payload[:200].replace("\n", " "))
+                titles.update(_extract_titles_from_payload("clip", payload))
+                batch = _iter_unique_ids(r"clip(-?\d+)_(\d+)", payload)
+                if not batch:
+                    batch = _iter_unique_ids(r"clip-(-?\d+)_(\d+)", payload)
+                new = [x for x in batch if x not in seen]
+                for x in new:
+                    seen.add(x)
+                if not new:
+                    break
+                ids.extend(new)
+                offset += len(new)
+                if offset > 10000:
+                    break
+
+        if not ids:
+            # Fallback: sometimes clips are returned via al_video.php with section=clips
+            print("[LOG] al_clips.php не дал id. Пробую al_video.php section=clips...")
+            seen = set()
+            offset = 0
+            while True:
+                st, payload = _post_al(
+                    "al_video.php",
+                    {
+                        "act": "load_videos_silent",
+                        "oid": str(owner_id),
+                        "offset": str(offset),
+                        "section": "clips",
+                        "al": "1",
+                    },
+                    referer=f"https://vk.com/videos{owner_id}?section=clips",
+                )
+                debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+                if debug and payload and offset == 0:
+                    try:
+                        dbg = base_out / "_debug_titles" / "al_video__load_videos_silent__section_clips__offset0.txt"
+                        dbg.parent.mkdir(parents=True, exist_ok=True)
+                        dbg.write_text(payload, encoding="utf-8", errors="ignore")
+                        print("[LOG] debug saved:", dbg)
+                    except Exception:
+                        pass
+                if st and st >= 400:
+                    if debug:
+                        print(f"[LOG] al_video.php(clips) HTTP {st} head:", payload[:200].replace("\n", " "))
+                titles.update(_extract_titles_from_payload("clip", payload))
+                batch = _iter_unique_ids(r"clip(-?\d+)_(\d+)", payload)
+                new = [x for x in batch if x not in seen]
+                for x in new:
+                    seen.add(x)
+                if not new:
+                    break
+                ids.extend(new)
+                offset += len(new)
+                if offset > 10000:
+                    break
+
+        if not ids:
+            debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+            if debug:
+                st, payload = _post_al(
+                    "al_clips.php",
+                    {"act": "load_clips_silent", "oid": str(owner_id), "offset": "0", "al": "1"},
+                    referer=url,
+                )
+                print("[LOG] al_clips.php debug HTTP", st, "len", len(payload), "head:", payload[:300].replace("\n", " "))
+            print("[LOG] Не удалось найти clip-oid_id (ни HTML, ни AJAX).")
+            return
+        out_dir = base_out / "clips"
+        print(f"[LOG] Найдено клипов: {len(ids)}")
+        print("[LOG] Получаю названия...")
+        items: List[Dict[str, str]] = []
+        for k in ids:
+            title = titles.get(k) or _get_vk_media_title("clip", k)
+            desc = descs.get(k, "")
+            items.append({"key": k, "title": title, "desc": desc})
+        for i, it in enumerate(items, 1):
+            t = _fmt_title_for_list(it.get("title", ""))
+            d = _fmt_title_for_list(it.get("desc", ""), max_len=80)
+            if t:
+                if d:
+                    print(f"{i:3d}. {t} — {d} [clip{it['key']}]")
+                else:
+                    print(f"{i:3d}. {t} [clip{it['key']}]")
+            else:
+                print(f"{i:3d}. clip{it['key']}")
+        if args.list_only:
+            return
+        chosen: Optional[List[int]] = None
+        if sys.stdin.isatty():
+            chosen = _select_indices(len(items))
+            if not chosen:
+                print("[LOG] Отмена.")
+                return
+        else:
+            if not args.yes:
+                print("[LOG] stdin не TTY. Чтобы скачать всё без вопросов, добавь --yes. Сейчас только показал список.")
+                return
+            chosen = list(range(len(items)))
+
+        if args.clip_desc:
+            for idx in chosen:
+                if items[idx].get("desc"):
+                    continue
+                k = items[idx]["key"]
+                meta = ytdlp_metadata(f"https://vk.com/clip{k}")
+                d = (meta.get("description") or "").strip()
+                d = re.sub(r"\s+", " ", d)
+                if d:
+                    items[idx]["desc"] = d
+                    # show what we found
+                    print(f"[LOG] clip desc: clip{k} -> {_fmt_title_for_list(d, max_len=120)}")
+        for idx in chosen:
+            k = items[idx]["key"]
+            run_ytdlp(f"https://vk.com/clip{k}", out_dir)
 
     # videos/clips/photos are handled by yt-dlp for now
     if "videos" in what_set:
-        run_ytdlp(f"https://vk.com/videos{downloader.group_owner_id()}", base_out / "videos")
+        download_group_videos_web(downloader.group_owner_id())
     if "clips" in what_set:
-        run_ytdlp(f"https://vk.com/clips{downloader.group_owner_id()}", base_out / "clips")
+        download_group_clips_web(downloader.group_owner_id())
     if "photos" in what_set:
         run_ytdlp(f"https://vk.com/albums{downloader.group_owner_id()}", base_out / "photos")
 
@@ -1774,33 +3129,72 @@ def main():
     downloaded = 0
     errors = 0
     skipped = 0
+    lock = threading.Lock()
+
+    jobs = int(args.jobs or 4)
+    if jobs < 1:
+        jobs = 1
+
+    # requests.Session is not thread-safe; create one per worker thread.
+    _thread_local = threading.local()
+
+    def _get_worker_session() -> requests.Session:
+        s = getattr(_thread_local, "session", None)
+        if s is not None:
+            return s
+        s = requests.Session()
+        s.headers.update(dict(downloader.session.headers))
+        for c in downloader.session.cookies:
+            try:
+                s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+            except Exception:
+                s.cookies.set(c.name, c.value, domain=".vk.com")
+        _thread_local.session = s
+        return s
 
     def download_one(audio, target_dir, idx, total):
         nonlocal downloaded, errors, skipped
-        print_progress(idx, total, f"[{idx}/{total}]")
+        session = _get_worker_session()
+        # Если url похож на заглушку — попробуем резолвить через web
         # Если url похож на заглушку — попробуем резолвить через web
         u = (audio.get("url") or "")
         if u and ("audio_api_unavailable" in u or "vk.com/audio" in u):
-            resolved = resolve_audio_url_web(downloader.session, audio)
+            resolved = resolve_audio_url_web(session, audio)
             if resolved:
                 audio["url"] = resolved
-        filepath, error = download_audio(audio, target_dir, downloader.session)
+        filepath, error = download_audio(audio, target_dir, session)
 
+        status = "ok"
         if error:
             if "Уже существует" in error:
+                status = "skipped"
+            else:
+                status = "error"
+        with lock:
+            if status == "ok":
+                downloaded += 1
+            elif status == "skipped":
                 skipped += 1
             else:
                 errors += 1
-                print(
-                    f"\x1b[2K  [ОШИБКА] {audio.get('artist')} - {audio.get('title')}: {error}"
-                )
-        else:
-            downloaded += 1
-            try:
-                size_kb = filepath.stat().st_size / 1024
-                print(f"\x1b[2K  [OK] {filepath.name} ({size_kb:.1f} KB)")
-            except Exception:
-                print(f"\x1b[2K  [OK] {filepath.name}")
+        return status, filepath, error, idx, total, audio
+
+    def _print_result(res):
+        status, filepath, error, idx, total, audio = res
+        print_progress(idx, total, f"[{idx}/{total}]")
+        if status == "skipped":
+            print(f"\x1b[2K  [SKIP] {audio.get('artist')} - {audio.get('title')}: {error}")
+            return
+        if status == "error":
+            print(f"\x1b[2K  [ОШИБКА] {audio.get('artist')} - {audio.get('title')}: {error}")
+            return
+        try:
+            size_kb = filepath.stat().st_size / 1024 if filepath else 0
+            name = filepath.name if filepath else build_track_filename(audio)
+            print(f"\x1b[2K  [OK] {name} ({size_kb:.1f} KB)")
+        except Exception:
+            name = filepath.name if filepath else build_track_filename(audio)
+            print(f"\x1b[2K  [OK] {name}")
 
     if mode == "1":
         for pl in playlist_jobs:
@@ -1815,13 +3209,45 @@ def main():
                 print("[LOG] Нет треков или недоступно.")
                 continue
             print(f"[LOG] Треков в плейлисте: {len(tracks)}")
-            for i, audio in enumerate(tracks, 1):
-                download_one(audio, pl_dir, i, len(tracks))
-                time.sleep(0.2)
+            if jobs == 1:
+                for i, audio in enumerate(tracks, 1):
+                    _print_result(download_one(audio, pl_dir, i, len(tracks)))
+                    time.sleep(0.2)
+            else:
+                print(f"[LOG] Параллельная загрузка: jobs={jobs}")
+                with _futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+                    futs = []
+                    total = len(tracks)
+                    for i, audio in enumerate(tracks, 1):
+                        futs.append(ex.submit(download_one, audio, pl_dir, i, total))
+                        time.sleep(0.05)  # мягко разгружаем VK/CDN
+                    for fut in _futures.as_completed(futs):
+                        try:
+                            _print_result(fut.result())
+                        except Exception as e:
+                            with lock:
+                                errors += 1
+                            print(f"\x1b[2K  [ОШИБКА] worker exception: {e}")
     else:
-        for i, audio in enumerate(audios, 1):
-            download_one(audio, output_dir, i, len(audios))
-            time.sleep(0.2)
+        if jobs == 1:
+            for i, audio in enumerate(audios, 1):
+                _print_result(download_one(audio, output_dir, i, len(audios)))
+                time.sleep(0.2)
+        else:
+            print(f"[LOG] Параллельная загрузка: jobs={jobs}")
+            with _futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+                futs = []
+                total = len(audios)
+                for i, audio in enumerate(audios, 1):
+                    futs.append(ex.submit(download_one, audio, output_dir, i, total))
+                    time.sleep(0.05)
+                for fut in _futures.as_completed(futs):
+                    try:
+                        _print_result(fut.result())
+                    except Exception as e:
+                        with lock:
+                            errors += 1
+                        print(f"\x1b[2K  [ОШИБКА] worker exception: {e}")
 
     print()
     print("=" * 60)

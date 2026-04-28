@@ -48,9 +48,20 @@ def dump_vk_cookies(devtools_http_base: str) -> list[dict]:
         vk = []
         for c in cookies:
             domain = c.get("domain") or ""
-            if "vk.com" not in domain:
+            # keep both vk.com and vkvideo.ru cookies
+            if ("vk.com" not in domain) and ("vkvideo.ru" not in domain):
                 continue
-            vk.append({"name": c.get("name"), "value": c.get("value")})
+            vk.append(
+                {
+                    "name": c.get("name"),
+                    "value": c.get("value"),
+                    "domain": c.get("domain"),
+                    "path": c.get("path"),
+                    "secure": bool(c.get("secure")),
+                    "httpOnly": bool(c.get("httpOnly")),
+                    "expires": c.get("expires"),
+                }
+            )
         return [c for c in vk if c.get("name") and c.get("value") is not None]
     finally:
         try:
