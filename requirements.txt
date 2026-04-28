@@ -3,5 +3,4 @@ vk_api>=11.10.0
 beautifulsoup4>=4.12.0
 browser-cookie3>=0.20.0
 websocket-client>=1.8.0
-vkaudiotoken>=0.0.4
-vkpymusic>=3.5.0
+yt-dlp>=2025.1.15

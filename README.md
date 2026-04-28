@@ -1,6 +1,6 @@
 # VK Audio Downloader
 
-Скрипт для скачивания аудио с VK групп/пабликов.
+Скрипт для скачивания аудио из VK групп/пабликов по плейлистам/альбомам.
 
 ## Установка
 
@@ -14,55 +14,56 @@ make install
 make run
 ```
 
-После старта скрипт попросит:
-- cookies JSON (экспорт из DevTools)
-- ID группы (например `settlersspb` или `-179835916`)
-- что скачивать: **плейлисты/альбомы** или **все треки**
+### Быстрый старт (рекомендуется)
+
+1) Запусти Vivaldi/Chrome с DevTools протоколом (CDP):
+
+```bash
+vivaldi-stable --remote-debugging-port=9222 --remote-allow-origins=*
+```
+
+2) Залогинься на `vk.com` в этом браузере.
+
+3) Сохрани cookies в `cookies.json` одной командой:
+
+```bash
+./venv/bin/python cdp_dump_vk_cookies.py --base http://127.0.0.1:9222 --out cookies.json
+```
+
+4) Запусти загрузку:
+
+```bash
+./venv/bin/python vk_audio_downloader.py --group settlersspb --what audio
+```
+
+По умолчанию сохраняет в `./out/<group>/audio/`, а плейлисты — в `./out/<group>/audio/playlists/<playlist>/`.
 
 ## Методы авторизации
 
-Сейчас оставлен один простой и рабочий способ: **cookies из браузера** (экспорт из DevTools).
+Оставлен один рабочий способ: **cookies залогиненной сессии**.
 
-Альтернатива (часто стабильнее для audio): получить **Kate Mobile audio token** через `vkaudiotoken`:
+- **Почему так**: OAuth токены и “клиентские” токены часто блокируются/режутся для `audio.*`, а web‑плеер работает через HLS (`.m3u8`), который мы скачиваем и собираем.
+
+### Получение cookies (без ручной копипасты)
+Самый надёжный вариант — через CDP (см. “Быстрый старт” выше).
+
+## CLI опции
+
+Посмотреть помощь:
 
 ```bash
-make get-kate
+./venv/bin/python vk_audio_downloader.py --help
 ```
 
-Сохранит `kate_token.json` (token + обязательный User-Agent).
+Основные параметры:
+- `--group`: группа (screen name или id)
+- `--what`: что скачивать (`audio`, `photos`, `videos`, `clips`, `all`)
+- `--out`: куда сохранять (по умолчанию `./out/<group>`)
+- `--cookies-path`: путь к cookies (`cookies.json`)
+- `--debug`: подробные логи (или `VK_DEBUG=1`)
 
-### Как получить cookies (Chrome/Vivaldi/Chromium)
-1. Открой `vk.com` и залогинься
-2. F12 → Application (или Storage) → Cookies → `https://vk.com`
-3. ПКМ по таблице cookies → Copy → Copy as JSON
-4. Сохрани в файл `cookies.json` в папке проекта
+## Про формат аудио
+VK отдаёт реальные треки как **HLS** (`index.m3u8` + `seg-*.ts` + `AES-128 key.pub`), поэтому скрипт:
+- декодирует `audio_api_unavailable` в `index.m3u8`
+- скачивает сегменты и собирает итоговый mp3
 
-### Как получить токен доступа (рекомендуется)
-
-1. Перейдите на: https://oauth.vk.com/authorize?client_id=1&scope=audio&redirect_uri=https://oauth.vk.com/blank.html&display=mobile&response_type=token
-2. Нажмите **"Разрешить"**
-3. В адресной строке браузера увидите URL вида:
-   ```
-   https://oauth.vk.com/blank.html#access_token=ABCDEF123456...
-   ```
-4. Скопируйте токен (всё после `access_token=`)
-5. Вставьте его при запуске скрипта (метод 3)
-
-**Важно:**cookies из браузера (Vivaldi) - это session cookies, которые не подходят для VK API. Нужен отдельный access token с правом `audio`.
-
-## Cookies файл
-
-Если используете метод 2, создайте файл `cookies.json` в папке проекта:
-
-```json
-[
-  {"name": "remixstlid", "value": "YOUR_VALUE"},
-  {"name": "remixlgck", "value": "YOUR_VALUE"}
-]
-```
-
-## Управление группой
-
-https://vk.com/audios-179835916?section=playlists
-
-Где `-179835916` - ID группы.

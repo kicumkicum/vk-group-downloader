@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""
-Скрипт для скачивания аудио альбомов с VK паблика.
-Поддержка:
-1. Аутентификация через cookies из браузера
-2. Аутентификация через токен доступа
-3. Логин/пароль (через vk_api библиотеку)
+"""Скрипт для скачивания аудио по плейлистам/альбомам из VK групп/пабликов.
+
+Авторизация: только через cookies (CDP/браузер), без логина/пароля.
 """
 
 import os
@@ -16,7 +13,8 @@ import hashlib
 import urllib.parse
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from html import unescape
+import subprocess
+import shutil
 
 try:
     import requests
@@ -56,10 +54,6 @@ try:
 except Exception:
     decode_audio_url = None
 
-try:
-    from vkpymusic import Service as VkPyMusicService
-except Exception:
-    VkPyMusicService = None
 
 def print_progress(current, total, prefix="Скачивание"):
     """Отображение прогресса"""
@@ -177,7 +171,7 @@ class VKAudioDownloader:
     def _api_request(self, method, params=None, http_method: str = "GET", api_version: str | None = None):
         """Вызов VK API (GET/POST)"""
         params = params or {}
-        # Параметры как в vkpymusic: они стабильнее для многих методов
+        # Параметры совместимости для некоторых методов VK
         params.setdefault("https", 1)
         params.setdefault("lang", "ru")
         params.setdefault("extended", 1)
@@ -207,155 +201,7 @@ class VKAudioDownloader:
             print(f"Ошибка API запроса: {e}")
             return {"error": {"error_msg": str(e)}}
 
-    def list_playlists_api(self, owner_id=None, count=100):
-        """Список плейлистов через VK API (требует токен + правильный UA)."""
-        if owner_id is None:
-            owner_id = self.group_owner_id()
-        else:
-            owner_id = self._normalize_owner_id(owner_id)
-        if owner_id is None:
-            print("[LOG] internal error: owner_id is None")
-            return []
-
-        playlists = []
-        offset = 0
-        while True:
-            data = self._api_request(
-                "audio.getPlaylists",
-                {"owner_id": owner_id, "count": count, "offset": offset},
-            )
-            if "error" in data:
-                print(f"[LOG] API playlists error: {data['error'].get('error_msg', '')}")
-                return playlists
-            resp = data.get("response") or {}
-            items = resp.get("items") or []
-            playlists.extend(items)
-            if len(items) < count:
-                break
-            offset += count
-            time.sleep(0.2)
-        return playlists
-
-    def iter_playlist_tracks_api(self, playlist, owner_id=None, batch=200):
-        """
-        Треки плейлиста через VK API.
-        Важно: для audio.get используется album_id (а не playlist_id).
-        """
-        access_key = None
-        playlist_id = None
-        if isinstance(playlist, dict):
-            playlist_id = int(playlist.get("id"))
-            owner_id = self._normalize_owner_id(playlist.get("owner_id", owner_id))
-            access_key = playlist.get("access_key") or playlist.get("accessKey")
-        else:
-            playlist_id = int(playlist)
-            if owner_id is None:
-                owner_id = self.group_owner_id()
-            else:
-                owner_id = self._normalize_owner_id(owner_id)
-
-        offset = 0
-        while True:
-            print(
-                f"[LOG] API request: audio.get owner_id={owner_id} album_id={int(playlist_id)} offset={offset} count={batch}"
-            )
-            data = self._api_request(
-                "audio.get",
-                {
-                    "owner_id": owner_id,
-                    "album_id": int(playlist_id),
-                    **({"access_key": access_key} if access_key else {}),
-                    "count": batch,
-                    "offset": offset,
-                },
-            )
-            if "error" in data:
-                err = data.get("error") or {}
-                msg = err.get("error_msg", "")
-                code = err.get("error_code")
-                # Some tokens expose playlists but block audio.get; try execute.getPlaylist
-                if code == 3 and "Unknown method" in msg:
-                    print("[LOG] audio.get недоступен для этого токена. Пробую execute.getPlaylist...")
-                    ex = self._api_request(
-                        "execute.getPlaylist",
-                        {
-                            "id": int(playlist_id),
-                            "owner_id": owner_id,
-                            **({"access_key": access_key} if access_key else {}),
-                            "audio_offset": offset,
-                            "audio_count": batch,
-                            "need_playlist": 0,
-                            "need_owner": 0,
-                        },
-                        http_method="POST",
-                        api_version="5.116",
-                    )
-                    if "error" in ex:
-                        print(
-                            f"[LOG] API playlist tracks error ({playlist_id}): {ex['error'].get('error_msg', '')}"
-                        )
-                        return
-                    resp2 = ex.get("response") or {}
-                    # Try to find audio items in common shapes
-                    items2 = None
-                    if isinstance(resp2, dict):
-                        for path in [
-                            ("audios", "items"),
-                            ("audios",),
-                            ("items",),
-                            ("playlist", "audios", "items"),
-                            ("playlist", "audios"),
-                        ]:
-                            cur = resp2
-                            ok = True
-                            for k in path:
-                                if isinstance(cur, dict) and k in cur:
-                                    cur = cur[k]
-                                else:
-                                    ok = False
-                                    break
-                            if ok and isinstance(cur, list):
-                                items2 = cur
-                                break
-                    if not items2:
-                        print("[LOG] execute.getPlaylist: не нашёл items в ответе")
-                        return
-                    for item in items2:
-                        if not isinstance(item, dict):
-                            continue
-                        yield {
-                            "id": item.get("id"),
-                            "owner_id": item.get("owner_id"),
-                            "title": item.get("title"),
-                            "artist": item.get("artist"),
-                            "url": item.get("url"),
-                            "duration": item.get("duration"),
-                            "access_key": item.get("access_key", ""),
-                        }
-                    # If less than batch returned, stop
-                    if len(items2) < batch:
-                        break
-                    offset += batch
-                    continue
-
-                print(f"[LOG] API playlist tracks error ({playlist_id}): {msg}")
-                return
-            resp = data.get("response") or {}
-            items = resp.get("items") or []
-            for item in items:
-                yield {
-                    "id": item.get("id"),
-                    "owner_id": item.get("owner_id"),
-                    "title": item.get("title"),
-                    "artist": item.get("artist"),
-                    "url": item.get("url"),
-                    "duration": item.get("duration"),
-                    "access_key": item.get("access_key", ""),
-                }
-            if len(items) < batch:
-                break
-            offset += batch
-            time.sleep(0.2)
+    # NOTE: VK audio API methods intentionally not used.
 
     def _get_page_html(self, url):
         """Получение HTML страницы"""
@@ -1673,10 +1519,9 @@ def main():
         description="Download VK group audio by playlists/albums.",
     )
     parser.add_argument(
-        "--auth",
-        choices=["cookies", "tokenua"],
-        default=None,
-        help="Auth mode. If omitted, interactive prompt is used.",
+        "--what",
+        default="audio",
+        help="What to download: audio, photos, videos, clips, all (comma-separated). Default: audio",
     )
     parser.add_argument(
         "--group",
@@ -1708,52 +1553,43 @@ def main():
     print("=" * 60)
     print()
 
-    # Auth mode
-    if args.auth is None:
-        print("Авторизация:")
-        print("1) VK token + User-Agent (как в vk-music-bot-api, без cookies)")
-        print("2) Cookies (CDP/браузер) fallback")
-        pick = (input(">> ").strip() or "2").strip()
-        auth_mode = "1" if pick == "1" else "2"
-    else:
-        auth_mode = "1" if args.auth == "tokenua" else "2"
+    what_raw = (args.what or "audio").strip().lower()
+    what_set = set()
+    for part in what_raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if p == "all":
+            what_set.update({"audio", "photos", "videos", "clips"})
+        else:
+            what_set.add(p)
+    unknown = sorted([w for w in what_set if w not in {"audio", "photos", "videos", "clips"}])
+    if unknown:
+        print("[LOG] Unknown --what values:", ", ".join(unknown))
+        return
 
     cookies_path = args.cookies_path
     cookies = {}
-    access_token = None
-    audio_ua = None
+    print("Авторизация: cookies (CDP/браузер), без логина/пароля.")
+    cookies = load_or_create_cookies_json(cookies_path)
+    if not cookies:
+        print("[LOG] Cookies не получены. Завершение.")
+        return
 
-    if auth_mode == "1":
-        access_token = os.environ.get("VK_AUDIO_TOKEN", "").strip() or input("VK_AUDIO_TOKEN: ").strip()
-        audio_ua = os.environ.get("VK_AUDIO_UA", "").strip() or input("VK_AUDIO_UA [Enter=KateMobileAndroid]: ").strip()
-        if not audio_ua:
-            audio_ua = "KateMobileAndroid/52.1 lite-445 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
-        if not access_token or not audio_ua:
-            print("[LOG] Нужны и токен, и User-Agent.")
-            print("[LOG] Как получить: vkhost.github.io -> VK Admin (или токен аудио-клиента) + UA из библиотеки/клиента.")
-            return
-    else:
-        print("Авторизация: cookies из DevTools (без пароля/2FA).")
-        cookies = load_or_create_cookies_json(cookies_path)
-        if not cookies:
-            print("[LOG] Cookies не получены. Завершение.")
-            return
-
-        ok, reason = cookies_look_complete(cookies)
-        if not ok:
-            print("[LOG] НЕ АВТОРИЗОВАН:", reason)
-            print("[LOG] Cookie names:", ", ".join(sorted(cookies.keys())))
-            return
+    ok, reason = cookies_look_complete(cookies)
+    if not ok:
+        print("[LOG] НЕ АВТОРИЗОВАН:", reason)
+        print("[LOG] Cookie names:", ", ".join(sorted(cookies.keys())))
+        return
 
     # Сначала проверяем что cookies живые, без запроса группы
     print()
-    if auth_mode != "1":
-        print("[LOG] Проверка cookies...")
-        probe = VKAudioDownloader("-1", cookies=cookies, access_token=None)
-        ok, reason = cookies_seem_valid(probe.session)
-        if not ok:
-            print("[LOG] Cookies недействительны:", reason)
-            return
+    print("[LOG] Проверка cookies...")
+    probe = VKAudioDownloader("-1", cookies=cookies, access_token=None)
+    ok, reason = cookies_seem_valid(probe.session)
+    if not ok:
+        print("[LOG] Cookies недействительны:", reason)
+        return
 
     # Group ID из URL: https://vk.com/audios-179835916?section=playlists
     try:
@@ -1767,9 +1603,7 @@ def main():
     # Инициализация загрузчика (cookies + группа)
     print()
     print("[LOG] Инициализация загрузчика...")
-    downloader = VKAudioDownloader(GROUP_ID, cookies=cookies, access_token=access_token)
-    if audio_ua:
-        downloader.session.headers["User-Agent"] = audio_ua
+    downloader = VKAudioDownloader(GROUP_ID, cookies=cookies, access_token=None)
 
     print("[LOG] Проверка доступа к группе...")
     try:
@@ -1778,20 +1612,61 @@ def main():
         print(f"[LOG] Ошибка: {e}")
         return
 
-    audio_ok = True
-    audio_reason = ""
-    if auth_mode != "1":
-        audio_ok, audio_reason = check_audio_playlists_access(downloader)
-        if not audio_ok:
-            print("[LOG] Нет доступа к audio по cookies:", audio_reason)
-            print("[LOG] Перехожу в режим плейлистов и пробую web-fallback (vk.com).")
-            mode = "1"
-        else:
-            print()
-            print("Что скачивать?")
-            print("1. Плейлисты/альбомы группы (рекомендуется)")
-            print("2. Все треки группы (как раньше)")
-            mode = (input(">> ").strip() or "1").strip()
+    # Base output dir
+    gid_num = abs(downloader.group_owner_id())
+    group_slug = sanitize_filename(GROUP_ID) if GROUP_ID else f"group_{gid_num}"
+    if group_slug.lstrip("-").isdigit():
+        group_slug = f"group_{gid_num}"
+    base_out = Path(args.out) if args.out else (Path.cwd() / "out" / group_slug)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    def cookies_to_netscape(cookie_path: Path):
+        lines = ["# Netscape HTTP Cookie File\n"]
+        for name, value in cookies.items():
+            if not name or name.startswith("_"):
+                continue
+            # domain, include_subdomains, path, secure, expires, name, value
+            lines.append(f".vk.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+        cookie_path.write_text("".join(lines), encoding="utf-8")
+
+    def run_ytdlp(url: str, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cookies_txt = base_out / "cookies.txt"
+        cookies_to_netscape(cookies_txt)
+        # Prefer module invocation for venv
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--cookies",
+            str(cookies_txt),
+            "-P",
+            str(out_dir),
+            "-o",
+            "%(title).200s [%(id)s].%(ext)s",
+            url,
+        ]
+        print("[LOG] yt-dlp:", url)
+        p = subprocess.run(cmd)
+        if p.returncode != 0:
+            print("[LOG] yt-dlp failed with code", p.returncode)
+
+    # videos/clips/photos are handled by yt-dlp for now
+    if "videos" in what_set:
+        run_ytdlp(f"https://vk.com/videos{downloader.group_owner_id()}", base_out / "videos")
+    if "clips" in what_set:
+        run_ytdlp(f"https://vk.com/clips{downloader.group_owner_id()}", base_out / "clips")
+    if "photos" in what_set:
+        run_ytdlp(f"https://vk.com/albums{downloader.group_owner_id()}", base_out / "photos")
+
+    if "audio" not in what_set:
+        return
+
+    audio_ok, audio_reason = check_audio_playlists_access(downloader)
+    if not audio_ok:
+        print("[LOG] Нет доступа к audio по cookies:", audio_reason)
+        print("[LOG] Перехожу в режим плейлистов и пробую web-fallback (vk.com).")
+        mode = "1"
     else:
         print()
         print("Что скачивать?")
@@ -1804,7 +1679,7 @@ def main():
 
     if mode == "1":
         print("[LOG] Получение списка плейлистов...")
-        playlists = downloader.list_playlists_api() if auth_mode == "1" else downloader.list_playlists()
+        playlists = downloader.list_playlists()
         if not playlists:
             if not audio_ok:
                 print("[LOG] Плейлисты не найдены даже через web-fallback.")
@@ -1874,14 +1749,8 @@ def main():
             return
         print(f"[LOG] Всего получено: {len(audios)} треков")
 
-    # Шаг 3: Выбор места сохранения
-    print()
-    gid_num = abs(downloader.group_owner_id())
-    group_slug = sanitize_filename(GROUP_ID) if GROUP_ID else f"group_{gid_num}"
-    if group_slug.lstrip("-").isdigit():
-        group_slug = f"group_{gid_num}"
-    default_dir = Path.cwd() / "out" / group_slug / "audio"
-    output_dir = Path(args.out) if args.out else default_dir
+    # Audio output dir
+    output_dir = base_out / "audio"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nСохранение в: {output_dir}")
@@ -1927,11 +1796,7 @@ def main():
             pl_dir.mkdir(parents=True, exist_ok=True)
             print()
             print(f"[LOG] Плейлист: {pl_title} (id={pl.get('id')})")
-            tracks = (
-                list(downloader.iter_playlist_tracks_api(pl))
-                if auth_mode == "1"
-                else list(downloader.iter_playlist_tracks(int(pl.get("id"))))
-            )
+            tracks = list(downloader.iter_playlist_tracks(int(pl.get("id"))))
             if not tracks:
                 print("[LOG] Нет треков или недоступно.")
                 continue

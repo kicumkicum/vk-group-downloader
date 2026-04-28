@@ -12,8 +12,6 @@ help:
 	@echo "  make venv       - Создать виртуальное окружение"
 	@echo "  make install    - Установить зависимости"
 	@echo "  make run        - Запустить скрипт"
-	@echo "  make get-token  - Получить токен через OAuth"
-	@echo "  make get-kate   - Получить аудио-токен Kate Mobile"
 	@echo "  make clean      - Удалить виртуальное окружение"
 	@echo ""
 	@echo "Примеры:"
@@ -41,13 +39,6 @@ run: install
 
 # Установка и запуск (одной командой)
 all: install run
-
-# Получение токена
-get-token:
-	$(PYTHON) get_token.py
-
-get-kate:
-	$(PYTHON) get_kate_token.py
 
 # Очистка
 clean:
