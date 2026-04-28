@@ -1644,6 +1644,11 @@ def main():
         action="store_true",
         help="Fetch clip descriptions for selected items via yt-dlp metadata (no download).",
     )
+    parser.add_argument(
+        "--ytdlp-bin",
+        default=None,
+        help="Path to yt-dlp executable (recommended on Python 3.8). Can also be set via YTDLP_BIN env.",
+    )
     args, _unknown = parser.parse_known_args()
 
     if args.debug:
@@ -1862,8 +1867,10 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         cookies_txt = base_out / "cookies.txt"
         cookies_to_netscape(cookies_txt)
-        # Prefer yt-dlp executable if installed; module requires Python >= 3.10 in recent versions.
-        exe = shutil.which("yt-dlp")
+        # Prefer yt-dlp executable; python module requires Python >= 3.10 in recent versions.
+        exe = args.ytdlp_bin or os.environ.get("YTDLP_BIN") or shutil.which("yt-dlp")
+        if exe and not os.access(exe, os.X_OK):
+            exe = None
         ua = downloader.session.headers.get(
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1891,20 +1898,34 @@ def main():
                 ]
             if exe:
                 return [exe] + common + [url]
+            # Don't try importing yt_dlp on Python < 3.10 (it may not be installed or supported).
+            if sys.version_info < (3, 10):
+                return []
             return [sys.executable, "-m", "yt_dlp"] + common + [url]
 
         # Log yt-dlp version for debugging (old versions often fall back to generic extractor)
         try:
-            ver_cmd = [exe, "--version"] if exe else [sys.executable, "-m", "yt_dlp", "--version"]
-            ver = subprocess.run(ver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout.strip()
-            if ver:
-                print("[LOG] yt-dlp version:", ver)
+            if exe:
+                ver_cmd = [exe, "--version"]
+                ver = subprocess.run(ver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout.strip()
+                if ver:
+                    print("[LOG] yt-dlp version:", ver)
+            else:
+                if sys.version_info < (3, 10):
+                    print("[LOG] yt-dlp не найден/не исполняемый. На Python 3.8 нужен yt-dlp как бинарник.")
+                    print("[LOG] Укажи путь через --ytdlp-bin или env YTDLP_BIN (пример: /usr/local/bin/yt-dlp).")
+                    return
         except Exception:
-            pass
+            if not exe and sys.version_info < (3, 10):
+                print("[LOG] yt-dlp не найден/не исполняемый. На Python 3.8 нужен yt-dlp как бинарник.")
+                print("[LOG] Укажи путь через --ytdlp-bin или env YTDLP_BIN.")
+                return
 
         print("[LOG] yt-dlp:", url)
         # First try with extra headers (helps avoid vk.com/badbrowser.php redirects)
         cmd = build_cmd(use_headers=True)
+        if not cmd:
+            return
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out = (p.stdout or "").strip()
         if out:
@@ -2620,7 +2641,9 @@ def main():
         """
         cookies_txt = base_out / "cookies.txt"
         cookies_to_netscape(cookies_txt)
-        exe = shutil.which("yt-dlp")
+        exe = args.ytdlp_bin or os.environ.get("YTDLP_BIN") or shutil.which("yt-dlp")
+        if exe and not os.access(exe, os.X_OK):
+            exe = None
         ua = downloader.session.headers.get(
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -2642,6 +2665,8 @@ def main():
                 url,
             ]
         else:
+            if sys.version_info < (3, 10):
+                return {}
             cmd = [
                 sys.executable,
                 "-m",
