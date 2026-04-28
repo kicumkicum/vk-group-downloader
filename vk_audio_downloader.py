@@ -1649,6 +1649,11 @@ def main():
         default=None,
         help="Path to yt-dlp executable (recommended on Python 3.8). Can also be set via YTDLP_BIN env.",
     )
+    parser.add_argument(
+        "--ytdlp-python",
+        default=None,
+        help="Python interpreter to run yt-dlp zipapp/script (e.g. /usr/bin/python3.10). Can also be set via YTDLP_PYTHON env.",
+    )
     args, _unknown = parser.parse_known_args()
 
     if args.debug:
@@ -1869,6 +1874,7 @@ def main():
         cookies_to_netscape(cookies_txt)
         # Prefer yt-dlp executable; python module requires Python >= 3.10 in recent versions.
         exe = args.ytdlp_bin or os.environ.get("YTDLP_BIN") or shutil.which("yt-dlp")
+        ytdlp_py = args.ytdlp_python or os.environ.get("YTDLP_PYTHON")
         if exe and not os.access(exe, os.X_OK):
             exe = None
         ua = downloader.session.headers.get(
@@ -1897,6 +1903,18 @@ def main():
                     "Accept-Language:ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 ]
             if exe:
+                # If yt-dlp is a python zipapp/script, allow forcing interpreter (python3.10+).
+                try:
+                    with open(exe, "rb") as f:
+                        head = f.read(64)
+                    is_elf = head.startswith(b"\x7fELF")
+                    is_py_zipapp = head.startswith(b"#!") and b"python" in head.lower()
+                except Exception:
+                    is_elf = False
+                    is_py_zipapp = False
+
+                if (not is_elf) and ytdlp_py:
+                    return [ytdlp_py, exe] + common + [url]
                 return [exe] + common + [url]
             # Don't try importing yt_dlp on Python < 3.10 (it may not be installed or supported).
             if sys.version_info < (3, 10):
@@ -1906,7 +1924,17 @@ def main():
         # Log yt-dlp version for debugging (old versions often fall back to generic extractor)
         try:
             if exe:
-                ver_cmd = [exe, "--version"]
+                # Same interpreter logic for --version
+                try:
+                    with open(exe, "rb") as f:
+                        head = f.read(64)
+                    is_elf = head.startswith(b"\x7fELF")
+                except Exception:
+                    is_elf = False
+                if (not is_elf) and ytdlp_py:
+                    ver_cmd = [ytdlp_py, exe, "--version"]
+                else:
+                    ver_cmd = [exe, "--version"]
                 ver = subprocess.run(ver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout.strip()
                 if ver:
                     print("[LOG] yt-dlp version:", ver)
@@ -1919,6 +1947,11 @@ def main():
             if not exe and sys.version_info < (3, 10):
                 print("[LOG] yt-dlp не найден/не исполняемый. На Python 3.8 нужен yt-dlp как бинарник.")
                 print("[LOG] Укажи путь через --ytdlp-bin или env YTDLP_BIN.")
+                return
+            # If it is a zipapp/script and python is too old, hint about --ytdlp-python
+            if exe and sys.version_info < (3, 10) and not ytdlp_py:
+                print("[LOG] Похоже yt-dlp установлен как python-zipapp и требует Python 3.10+.")
+                print("[LOG] Укажи интерпретатор через --ytdlp-python /usr/bin/python3.10 (или env YTDLP_PYTHON).")
                 return
 
         print("[LOG] yt-dlp:", url)
