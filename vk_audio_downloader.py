@@ -1633,19 +1633,32 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         cookies_txt = base_out / "cookies.txt"
         cookies_to_netscape(cookies_txt)
-        # Prefer module invocation for venv
-        cmd = [
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "--cookies",
-            str(cookies_txt),
-            "-P",
-            str(out_dir),
-            "-o",
-            "%(title).200s [%(id)s].%(ext)s",
-            url,
-        ]
+        # Prefer yt-dlp executable if installed; module requires Python >= 3.10 in recent versions.
+        exe = shutil.which("yt-dlp")
+        if exe:
+            cmd = [
+                exe,
+                "--cookies",
+                str(cookies_txt),
+                "-P",
+                str(out_dir),
+                "-o",
+                "%(title).200s [%(id)s].%(ext)s",
+                url,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--cookies",
+                str(cookies_txt),
+                "-P",
+                str(out_dir),
+                "-o",
+                "%(title).200s [%(id)s].%(ext)s",
+                url,
+            ]
         print("[LOG] yt-dlp:", url)
         p = subprocess.run(cmd)
         if p.returncode != 0:
