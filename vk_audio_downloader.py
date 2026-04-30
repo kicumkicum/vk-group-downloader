@@ -376,8 +376,87 @@ class VKAudioDownloader:
         if playlists:
             return playlists
 
-        # Fallback #1: vk.com internal AJAX (al_audio.php). Works when m.vk.com gives Access Denied.
+        # Fallback #1: vk.com audio catalog loader (what the site uses now)
+        # POST https://vk.com/audio?act=load_catalog_section  al=1&section_id=PUld...
         debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        print("[LOG] Fallback: пробую vk.com/audio?act=load_catalog_section ...")
+        referer = f"https://vk.com/audios{owner_id}?section=playlists"
+        page = self._get_page_html(referer) or ""
+
+        # Try to find section_id in page html
+        section_id = ""
+        # Common: section_id=PUld... in inline JSON or URLs
+        m = re.search(r"(?:section_id=|\"section_id\"\s*:\s*\")(?P<sid>PUld[0-9A-Za-z_-]{20,})", page)
+        if m:
+            section_id = m.group("sid")
+        # Sometimes only raw PUld... appears; pick first that looks like section id
+        if not section_id:
+            m = re.search(r"\b(PUld[0-9A-Za-z_-]{20,})\b", page)
+            if m:
+                section_id = m.group(1)
+
+        # Allow manual override via env
+        section_id = (os.environ.get("VK_AUDIO_SECTION_ID") or "").strip() or section_id
+        if debug:
+            print("[LOG] audio playlists section_id:", section_id[:32] + ("..." if len(section_id) > 32 else ""))
+
+        def _load_catalog(section_id_value: str) -> Tuple[int, str]:
+            try:
+                rr = self.session.post(
+                    "https://vk.com/audio",
+                    data={"act": "load_catalog_section", "al": "1", "section_id": section_id_value},
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Accept": "*/*",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://vk.com",
+                        "Referer": referer,
+                    },
+                    timeout=25,
+                )
+                return int(getattr(rr, "status_code", 0) or 0), (rr.text or "")
+            except Exception:
+                return 0, ""
+
+        found: Dict[Tuple[int, int], Optional[str]] = {}
+        titles: Dict[Tuple[int, int], str] = {}
+        if section_id:
+            st, payload = _load_catalog(section_id)
+            if debug:
+                print(f"[LOG] load_catalog_section HTTP {st} len={len(payload)}")
+                if payload:
+                    try:
+                        dbg_dir = Path.cwd() / "out" / sanitize_filename(str(owner_id)) / "_debug_audio"
+                        dbg_dir.mkdir(parents=True, exist_ok=True)
+                        (dbg_dir / "audio__load_catalog_section__playlists.txt").write_text(
+                            payload, encoding="utf-8", errors="ignore"
+                        )
+                    except Exception:
+                        pass
+            # Extract playlist links and titles
+            for mm in re.finditer(r"act=audio_playlist(-?\d+)_(\d+)(?:[^\"]*access_hash=([0-9a-zA-Z_]+))?", payload):
+                o = int(mm.group(1))
+                pid = int(mm.group(2))
+                ah = mm.group(3) if mm.group(3) else None
+                found[(o, pid)] = ah
+            for mm in re.finditer(
+                r"audio_playlist(-?\d+)_(\d+)[^<>\n]{0,500}?(?:data-title|aria-label|title)=\"([^\"]+)\"",
+                payload,
+            ):
+                o = int(mm.group(1))
+                pid = int(mm.group(2))
+                t = _html.unescape(mm.group(3)).strip()
+                if t:
+                    titles[(o, pid)] = t
+
+        if found:
+            playlists = []
+            for (o, pid), ah in found.items():
+                title = titles.get((o, pid)) or f"playlist_{pid}"
+                playlists.append({"id": pid, "owner_id": o, "title": title, "access_hash": ah})
+            return playlists
+
+        # Fallback #1: vk.com internal AJAX (al_audio.php). Works when m.vk.com gives Access Denied.
         print("[LOG] Fallback: пробую al_audio.php (vk.com AJAX) для плейлистов...")
         referer = f"https://vk.com/audios{owner_id}?section=playlists"
         self.session.get("https://vk.com/", timeout=10)
