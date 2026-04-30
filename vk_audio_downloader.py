@@ -433,19 +433,38 @@ class VKAudioDownloader:
                         )
                     except Exception:
                         pass
+            # Extract embedded HTML from JSON payload if possible.
+            html_payload = payload
+            try:
+                if payload.lstrip().startswith("{"):
+                    j = json.loads(payload)
+                    # Typical: {"payload":[0,[["<div ...">]]]}
+                    html_payload = (((j.get("payload") or [None, []])[1] or [[]])[0] or [""])[0] or payload
+            except Exception:
+                html_payload = payload
+
             # Extract playlist links and titles
-            for mm in re.finditer(r"act=audio_playlist(-?\d+)_(\d+)(?:[^\"]*access_hash=([0-9a-zA-Z_]+))?", payload):
+            # New markup: blocks contain data-id="-owner_playlist" and titles often live in <img alt='...'>.
+            for mm in re.finditer(r'data-id="(-?\d+)_(\d+)"', html_payload):
                 o = int(mm.group(1))
                 pid = int(mm.group(2))
-                ah = mm.group(3) if mm.group(3) else None
+                found.setdefault((o, pid), None)
+
+            # access_hash often appears in followPlaylist(..., 'hash', ...)
+            for mm in re.finditer(r"followPlaylist\([^,]+,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*'([0-9a-f]{8,})'", html_payload, re.I):
+                o = int(mm.group(1))
+                pid = int(mm.group(2))
+                ah = mm.group(3)
                 found[(o, pid)] = ah
+
+            # Title: image alt can be single-quoted or double-quoted
             for mm in re.finditer(
-                r"audio_playlist(-?\d+)_(\d+)[^<>\n]{0,500}?(?:data-title|aria-label|title)=\"([^\"]+)\"",
-                payload,
+                r'data-id="(-?\d+)_(\d+)"[\s\S]{0,1200}?<img[^>]+alt=(?:\'([^\']+)\'|"([^"]+)")',
+                html_payload,
             ):
                 o = int(mm.group(1))
                 pid = int(mm.group(2))
-                t = _html.unescape(mm.group(3)).strip()
+                t = _html.unescape((mm.group(3) or mm.group(4) or "")).strip()
                 if t:
                     titles[(o, pid)] = t
 
@@ -1816,6 +1835,11 @@ def main():
         default=None,
         help="Python interpreter to run yt-dlp zipapp/script (e.g. /usr/bin/python3.10). Can also be set via YTDLP_PYTHON env.",
     )
+    parser.add_argument(
+        "--http-log",
+        default=None,
+        help="Write HTTP request/response log to this JSONL file (default: out/<group>/_http.jsonl). Secrets are redacted.",
+    )
     args, _unknown = parser.parse_known_args()
 
     if args.debug:
@@ -1903,6 +1927,134 @@ def main():
         group_slug = f"group_{gid_num}"
     base_out = Path(args.out) if args.out else (Path.cwd() / "out" / group_slug)
     base_out.mkdir(parents=True, exist_ok=True)
+
+    # ---- HTTP logging (JSONL) ----
+    http_log_path = Path(args.http_log) if args.http_log else (base_out / "_http.jsonl")
+
+    def _redact(obj: Any) -> Any:
+        """
+        Redact secrets from request/response logs.
+        We specifically remove cookies and tokens.
+        """
+        try:
+            if isinstance(obj, dict):
+                out: Dict[str, Any] = {}
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if kl in {"cookie", "set-cookie", "authorization"}:
+                        out[k] = "<redacted>"
+                        continue
+                    if "token" in kl or "remixsid" in kl or "remixnsid" in kl or "httoken" in kl:
+                        out[k] = "<redacted>"
+                        continue
+                    out[k] = _redact(v)
+                return out
+            if isinstance(obj, list):
+                return [_redact(x) for x in obj]
+            if isinstance(obj, str):
+                s = obj
+                # common token patterns in urlencoded strings
+                s = re.sub(r"(?i)(access_token=)[^&\\s]+", r"\\1<redacted>", s)
+                s = re.sub(r"(?i)(remixsid=)[^;\\s]+", r"\\1<redacted>", s)
+                s = re.sub(r"(?i)(remixnsid=)[^;\\s]+", r"\\1<redacted>", s)
+                s = re.sub(r"(?i)(httoken=)[^;\\s]+", r"\\1<redacted>", s)
+                return s
+            return obj
+        except Exception:
+            return "<redacted>"
+
+    _http_log_lock = threading.Lock()
+
+    def attach_http_logger(sess: requests.Session, label: str):
+        """
+        Wrap sess.request to log all HTTP calls into http_log_path as JSONL.
+        """
+        orig = sess.request
+
+        def logged_request(method: str, url: str, **kwargs):
+            t0 = time.time()
+            req_headers = dict(kwargs.get("headers") or {})
+            params = kwargs.get("params")
+            data = kwargs.get("data")
+            json_data = kwargs.get("json")
+            timeout = kwargs.get("timeout")
+
+            # Avoid logging huge/binary bodies; keep previews only.
+            body_preview = ""
+            if isinstance(data, (str, bytes)):
+                try:
+                    body_preview = data.decode("utf-8", "ignore") if isinstance(data, bytes) else data
+                except Exception:
+                    body_preview = ""
+            elif isinstance(data, dict):
+                try:
+                    body_preview = "&".join([f"{k}={v}" for k, v in list(data.items())[:50]])
+                except Exception:
+                    body_preview = ""
+
+            rec_req = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "type": "request",
+                "label": label,
+                "method": str(method).upper(),
+                "url": url,
+                "params": params,
+                "timeout": timeout,
+                "headers": req_headers,
+                "data_preview": body_preview[:2000],
+                "json": json_data,
+            }
+
+            try:
+                resp = orig(method, url, **kwargs)
+                dt_ms = int((time.time() - t0) * 1000)
+                text = ""
+                try:
+                    text = resp.text or ""
+                except Exception:
+                    text = ""
+                rec_res = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "type": "response",
+                    "label": label,
+                    "method": str(method).upper(),
+                    "url": getattr(resp, "url", url),
+                    "status": getattr(resp, "status_code", None),
+                    "elapsed_ms": dt_ms,
+                    "resp_headers": dict(getattr(resp, "headers", {}) or {}),
+                    "text_len": len(text),
+                    "text_preview": (text[:4000] if text else ""),
+                }
+                with _http_log_lock:
+                    http_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with http_log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(_redact(rec_req), ensure_ascii=False) + "\n")
+                        f.write(json.dumps(_redact(rec_res), ensure_ascii=False) + "\n")
+                return resp
+            except Exception as e:
+                dt_ms = int((time.time() - t0) * 1000)
+                rec_err = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "type": "error",
+                    "label": label,
+                    "method": str(method).upper(),
+                    "url": url,
+                    "elapsed_ms": dt_ms,
+                    "error": str(e),
+                }
+                with _http_log_lock:
+                    http_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with http_log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(_redact(rec_req), ensure_ascii=False) + "\n")
+                        f.write(json.dumps(_redact(rec_err), ensure_ascii=False) + "\n")
+                raise
+
+        sess.request = logged_request  # type: ignore
+
+    try:
+        attach_http_logger(downloader.session, "main")
+    except Exception:
+        pass
 
     def _vkvideo_handles() -> List[str]:
         """
@@ -3284,6 +3436,8 @@ def main():
                 cnt = pl.get("count") or pl.get("audio_count") or "?"
                 pid = pl.get("id")
                 print(f"{i:2d}. {title} (tracks: {cnt}) [id={pid}]")
+            if args.list_only:
+                return
             print()
             print("Что скачать?")
             print("- all / y  : все плейлисты")
