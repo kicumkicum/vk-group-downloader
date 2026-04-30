@@ -376,6 +376,89 @@ class VKAudioDownloader:
         if playlists:
             return playlists
 
+        # Fallback #1: vk.com internal AJAX (al_audio.php). Works when m.vk.com gives Access Denied.
+        debug = os.environ.get("VK_DEBUG", "").strip() not in {"", "0", "false", "False"}
+        print("[LOG] Fallback: пробую al_audio.php (vk.com AJAX) для плейлистов...")
+        referer = f"https://vk.com/audios{owner_id}?section=playlists"
+        self.session.get("https://vk.com/", timeout=10)
+
+        def _al_audio(data: Dict[str, Any]) -> Tuple[int, str]:
+            try:
+                rr = self.session.post(
+                    "https://vk.com/al_audio.php",
+                    data=data,
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Accept": "*/*",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Origin": "https://vk.com",
+                        "Referer": referer,
+                    },
+                    timeout=20,
+                )
+                return int(getattr(rr, "status_code", 0) or 0), (rr.text or "")
+            except Exception:
+                return 0, ""
+
+        found: Dict[Tuple[int, int], Optional[str]] = {}
+        titles: Dict[Tuple[int, int], str] = {}
+        offset = 0
+        for act in ("audio_playlists", "load_playlists", "load_albums"):
+            offset = 0
+            for _ in range(0, 30):  # safety cap
+                st, payload = _al_audio(
+                    {
+                        "act": act,
+                        "owner_id": str(owner_id),
+                        "offset": str(offset),
+                        "al": "1",
+                    }
+                )
+                if debug:
+                    print(f"[LOG] al_audio.php act={act} HTTP {st} len={len(payload)}")
+                    if offset == 0 and payload:
+                        try:
+                            dbg_dir = Path.cwd() / "out" / sanitize_filename(str(owner_id)) / "_debug_audio"
+                            dbg_dir.mkdir(parents=True, exist_ok=True)
+                            (dbg_dir / f"al_audio__{act}__offset0.txt").write_text(payload, encoding="utf-8", errors="ignore")
+                        except Exception:
+                            pass
+                if not payload:
+                    break
+
+                # Extract playlist links
+                for m in re.finditer(r"act=audio_playlist(-?\d+)_(\d+)(?:[^\"]*access_hash=([0-9a-zA-Z_]+))?", payload):
+                    o = int(m.group(1))
+                    pid = int(m.group(2))
+                    ah = m.group(3) if m.group(3) else None
+                    found[(o, pid)] = ah
+
+                # Try to extract titles close to playlist id (best-effort)
+                for m in re.finditer(r"audio_playlist(-?\d+)_(\d+)[^<>\n]{0,400}?(?:data-title|aria-label|title)=\"([^\"]+)\"", payload):
+                    o = int(m.group(1))
+                    pid = int(m.group(2))
+                    t = _html.unescape(m.group(3)).strip()
+                    if t:
+                        titles[(o, pid)] = t
+
+                # Pagination heuristic: if payload doesn't bring new playlists, stop.
+                before = len(found)
+                if len(found) == before and offset > 0:
+                    break
+                # Increase offset conservatively
+                offset += 50
+                time.sleep(0.2)
+
+            if found:
+                break
+
+        if found:
+            playlists = []
+            for (o, pid), ah in found.items():
+                title = titles.get((o, pid)) or f"playlist_{pid}"
+                playlists.append({"id": pid, "owner_id": o, "title": title, "access_hash": ah})
+            return playlists
+
         # Fallback: парсим vk.com/audios{owner}?section=playlists
         print("[LOG] Fallback: парсинг плейлистов с vk.com (web).")
         url = f"https://vk.com/audios{owner_id}?section=playlists"
